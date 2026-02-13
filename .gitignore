@@ -8,9 +8,6 @@ __pycache__/
 *$py.class
 *.so
 
-# C++ 编译产物
-utils/mycpp/build/
-
 # 模型权重（太大）
 weights/*.pth
 
@@ -28,8 +25,6 @@ weights/*.pth
 .DS_Store
 Thumbs.db
 
-# 忽略未跟踪的文件
+# 数据、权重文件
 demo_data/
-
-
 weights/
