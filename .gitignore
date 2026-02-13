@@ -29,34 +29,7 @@ weights/*.pth
 Thumbs.db
 
 # 忽略未跟踪的文件
-demo_data/tooth/masks/
-demo_data/tooth/mesh/
-demo_data/tooth/rgb/
+demo_data/
 
-demo_data/tooth_gt/annotations.json
-demo_data/tooth_gt/keypoints_3d_model.json
-demo_data/tooth_gt/mesh/
-
-demo_data/tooth_train/annotations.json
-demo_data/tooth_train/depth/
-demo_data/tooth_train/depth_float32_m_vis/
-demo_data/tooth_train/keypoints_3d_model.json
-demo_data/tooth_train/masks/
-demo_data/tooth_train/mesh/
-demo_data/tooth_train/miss/
-demo_data/tooth_train/rgb/
-
-demo_data/ztooth/masks/
-demo_data/ztooth/mesh/
-demo_data/ztooth/rgb/
-
-docker/
-
-learning/models/plugin.yml
-learning/models/plugin_codes/
-learning/models/run.bash
-
-utils/mycpp/include/
-utils/mycpp/src/
 
 weights/
