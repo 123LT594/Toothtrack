@@ -1,0 +1,3 @@
+/workspace/mycpp/build/CMakeFiles/mycpp.dir
+/workspace/mycpp/build/CMakeFiles/edit_cache.dir
+/workspace/mycpp/build/CMakeFiles/rebuild_cache.dir
