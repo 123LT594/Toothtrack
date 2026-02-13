@@ -180,8 +180,9 @@ if __name__ == "__main__":
                 pose_centered=pose_centered if (i == 0 and use_rt_init) else None,
                 use_rt_init=(i == 0 and use_rt_init))
 
-            cv2.imshow("3D Model Overlay", vis[..., ::-1])
-            cv2.waitKey(1)
+            # cv2.imshow 需要图形界面，无头模式下跳过
+            # cv2.imshow("3D Model Overlay", vis[..., ::-1])
+            # cv2.waitKey(1)
             cv2.imwrite(os.path.join(img_output_dir, f"{reader.id_strs[i]}.png"), vis[..., ::-1])
 
             if SAVE_VIDEO and video_writer is not None:
