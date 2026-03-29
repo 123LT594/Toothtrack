@@ -1,0 +1,14 @@
+[
+{
+  "directory": "/root/FoundationPose/mycpp/build",
+  "command": "/usr/bin/c++ -DBOOST_PROGRAM_OPTIONS_DYN_LINK -DBOOST_PROGRAM_OPTIONS_NO_LIB -DBOOST_SYSTEM_DYN_LINK -DBOOST_SYSTEM_NO_LIB -Dmycpp_EXPORTS -I/root/FoundationPose/mycpp/include -isystem /root/miniconda/envs/foundationpose/lib/python3.9/site-packages/pybind11/include -isystem /root/miniconda/envs/foundationpose/include/python3.9 -isystem /root/miniconda/envs/foundationpose/include -isystem /root/miniconda/envs/foundationpose/include/eigen3  -std=c++14 -fopenmp -g3 -O3 -O3 -DNDEBUG -fPIC -fvisibility=hidden -flto -fno-fat-lto-objects -o CMakeFiles/mycpp.dir/src/app/pybind_api.cpp.o -c /root/FoundationPose/mycpp/src/app/pybind_api.cpp",
+  "file": "/root/FoundationPose/mycpp/src/app/pybind_api.cpp",
+  "output": "CMakeFiles/mycpp.dir/src/app/pybind_api.cpp.o"
+},
+{
+  "directory": "/root/FoundationPose/mycpp/build",
+  "command": "/usr/bin/c++ -DBOOST_PROGRAM_OPTIONS_DYN_LINK -DBOOST_PROGRAM_OPTIONS_NO_LIB -DBOOST_SYSTEM_DYN_LINK -DBOOST_SYSTEM_NO_LIB -Dmycpp_EXPORTS -I/root/FoundationPose/mycpp/include -isystem /root/miniconda/envs/foundationpose/lib/python3.9/site-packages/pybind11/include -isystem /root/miniconda/envs/foundationpose/include/python3.9 -isystem /root/miniconda/envs/foundationpose/include -isystem /root/miniconda/envs/foundationpose/include/eigen3  -std=c++14 -fopenmp -g3 -O3 -O3 -DNDEBUG -fPIC -fvisibility=hidden -flto -fno-fat-lto-objects -o CMakeFiles/mycpp.dir/src/Utils.cpp.o -c /root/FoundationPose/mycpp/src/Utils.cpp",
+  "file": "/root/FoundationPose/mycpp/src/Utils.cpp",
+  "output": "CMakeFiles/mycpp.dir/src/Utils.cpp.o"
+}
+]

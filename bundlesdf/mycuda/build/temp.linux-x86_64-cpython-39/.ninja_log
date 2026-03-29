@@ -1,0 +1,9 @@
+# ninja log v5
+1	26539	1771941053884918717	/root/FoundationPose/bundlesdf/mycuda/build/temp.linux-x86_64-cpython-39/bindings.o	56f151e8a3ea1e1b
+1	82174	1771941109536241156	/root/FoundationPose/bundlesdf/mycuda/build/temp.linux-x86_64-cpython-39/common.o	b0b411732c5272ca
+8	27190	1771941137607921999	/root/FoundationPose/bundlesdf/mycuda/build/temp.linux-x86_64-cpython-39/root/FoundationPose/bundlesdf/mycuda/torch_ngp_grid_encoder/bindings.o	2d24361cd1c795d1
+8	138030	1771941248470792308	/root/FoundationPose/bundlesdf/mycuda/build/temp.linux-x86_64-cpython-39/root/FoundationPose/bundlesdf/mycuda/torch_ngp_grid_encoder/gridencoder.o	a9ef14835e27dfd6
+9	27536	1772029094472635597	/root/Toothtrack/bundlesdf/mycuda/build/temp.linux-x86_64-cpython-39/bindings.o	3703dfa757745f37
+9	85853	1772029152800717806	/root/Toothtrack/bundlesdf/mycuda/build/temp.linux-x86_64-cpython-39/common.o	c8a31074e4062e56
+7	28440	1772029181928762739	/root/Toothtrack/bundlesdf/mycuda/build/temp.linux-x86_64-cpython-39/root/Toothtrack/bundlesdf/mycuda/torch_ngp_grid_encoder/bindings.o	e9634c8f243a2b37
+7	133846	1772029287336944411	/root/Toothtrack/bundlesdf/mycuda/build/temp.linux-x86_64-cpython-39/root/Toothtrack/bundlesdf/mycuda/torch_ngp_grid_encoder/gridencoder.o	d9cff5b4c756f35e

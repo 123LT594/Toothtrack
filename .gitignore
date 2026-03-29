@@ -1,0 +1,30 @@
+# 输出目录
+output*/
+output_depth/
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# 模型权重（太大）
+weights/*.pth
+
+# 视频文件
+*.mp4
+
+# NumPy 数组
+*.npy
+
+# IDE
+.vscode/
+.idea/
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 数据、权重文件
+demo_data/
+weights/
