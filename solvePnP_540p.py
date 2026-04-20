@@ -11,7 +11,7 @@ from tqdm import tqdm
 # ================= 配置：路径直接指向 tooth_gt =================
 DATA_DIR = "./demo_data/tooth_gt"
 
-MESH_TOOTH = os.path.join(DATA_DIR, "mesh/teeth.obj")
+MESH_TOOTH = os.path.join(DATA_DIR, "mesh/tooth.obj")
 BALL_FILES = [os.path.join(DATA_DIR, f"mesh/{i}.obj") for i in [1, 2, 3, 4]]
 K_PATH = os.path.join(DATA_DIR, "cam_K.txt") 
 ANN_PATH = os.path.join(DATA_DIR, "annotations_540p.json")

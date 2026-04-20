@@ -37,12 +37,13 @@ if __name__ == "__main__":
     parser.add_argument("--mode", type=int, default=1)
     
     # 🌟 确保加载你刚才【全量数据】训练出的新权重
-    parser.add_argument("--joint_weight", type=str, default="/root/lanyun-tmp/models_joint/joint_best.pth")
+    parser.add_argument("--joint_weight", type=str, default="/root/lanyun-tmp/models/models_joint/joint_best.pth")
     
     args = parser.parse_args()
 
+    output_root = "/root/lanyun-tmp/output"
     beijing_tz = pytz.timezone('Asia/Shanghai')
-    output_dir = os.path.join(code_dir, "output", f"{dt.now(beijing_tz).strftime('%m%d_%H%M')}_joint_naked_test")
+    output_dir = os.path.join(output_root, f"{dt.now(beijing_tz).strftime('%m%d_%H%M')}_joint_track")
     img_output_dir = os.path.join(output_dir, "img")
     os.makedirs(img_output_dir, exist_ok=True)
 
