@@ -13,12 +13,11 @@ DATA_DIR = "./demo_data/tooth_gt"
 
 MESH_TOOTH = os.path.join(DATA_DIR, "mesh/teeth.obj")
 BALL_FILES = [os.path.join(DATA_DIR, f"mesh/{i}.obj") for i in [1, 2, 3, 4]]
-# ⚠️ 这里请确保你的 cam_K.txt 已经是 540p 的内参！
 K_PATH = os.path.join(DATA_DIR, "cam_K.txt") 
-ANN_PATH = os.path.join(DATA_DIR, "annotations.json")
+ANN_PATH = os.path.join(DATA_DIR, "annotations_540p.json")
 RGB_DIR = os.path.join(DATA_DIR, "rgb")
 
-# 输出目录 (因为你的 RGB 已经是 540p 了，无需再输出一遍 RGB)
+# 输出目录
 DEPTH_540_OUT = os.path.join(DATA_DIR, "depth")
 POSE_540_OUT = os.path.join(DATA_DIR, "pose")
 VIS_540_OUT = os.path.join(DATA_DIR, "vis_check")
@@ -45,13 +44,13 @@ def setup_renderer(mesh_path, K, h, w):
     return scene, pyrender.OffscreenRenderer(w, h), cam_node
 
 def main():
-    # 1. 创建输出文件夹 (不再包含 RGB)
+    # 1. 创建输出文件夹
     for d in [DEPTH_540_OUT, POSE_540_OUT, VIS_540_OUT]: 
         os.makedirs(d, exist_ok=True)
     
     kpts_3d = get_ball_centroids()
     
-    # 2. 直接读取 540p 的内参 (不再除以 2)
+    # 2. 直接读取 540p 的内参
     K_540 = np.loadtxt(K_PATH, dtype=np.float64)
     
     with open(ANN_PATH, 'r') as f:
@@ -68,7 +67,7 @@ def main():
     bad_count = 0
     total_processed = 0
 
-    print(f"\n🚀 开始处理数据 (输入图片和内参已是 540p，标注自动缩放对齐)...")
+    print(f"\n🚀 开始处理数据 (输入图片、内参、标注均已是纯正的 540p)...")
     pbar = tqdm(annotations.items(), desc="Generating 540p GT")
     
     for frame_name, ball_anns in pbar:
@@ -76,14 +75,13 @@ def main():
         img_540 = cv2.imread(img_path)
         if img_540 is None: continue
         
-        # 简单安全校验，防止你不小心放错了原图
+        # 简单安全校验
         if img_540.shape[0] != 540 or img_540.shape[1] != 960:
             print(f"⚠️ 警告: 图片 {frame_name} 的分辨率不是 960x540！实际是 {img_540.shape[1]}x{img_540.shape[0]}")
         
         try:
-            # 3. 唯独 2D 标注点还是 1080p，所以这里依然要 * 0.5 降维对齐！
-            pts_2d_orig = np.array([ball_anns[f'ball_{i}'] for i in range(1, 5)], dtype=np.float64)
-            pts_2d_540 = pts_2d_orig * 0.5
+            # 🌟 核心修改 2：因为读取的已经是 540p 的 JSON，直接使用，不再乘以 0.5！
+            pts_2d_540 = np.array([ball_anns[f'ball_{i}'] for i in range(1, 5)], dtype=np.float64)
         except: continue
 
         # ================= PnP 匹配与渲染 =================
@@ -131,7 +129,7 @@ def main():
     med_gold_err = np.median(gold_errors) if gold_count > 0 else 0
 
     print("\n" + "="*50)
-    print(f"✅ 处理完毕！未发生不必要的重采样。")
+    print(f"✅ 处理完毕！")
     print(f"📊 总处理帧数: {total_processed} | 黄金帧 (误差 <= 1.5px): {gold_count}")
     print(f"✨ 黄金帧平均误差: {avg_gold_err:.4f} px (540p尺度)")
     print(f"📏 黄金帧中位数误差: {med_gold_err:.4f} px (540p尺度)")
