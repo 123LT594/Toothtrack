@@ -237,7 +237,7 @@ class PoseRefinePredictor:
             ckpt = torch.load(ckpt_dir)
             if 'model' in ckpt:
                 ckpt = ckpt['model']
-            self.model.load_state_dict(ckpt)
+            self.model.load_state_dict(ckpt, strict=False)
 
             self.model.cuda().eval()
         # logging.info("init done")
@@ -253,13 +253,10 @@ class PoseRefinePredictor:
         '''
 
         torch.set_default_tensor_type('torch.cuda.FloatTensor')
-        # logging.info(f"type of ob_in_cams:{type(ob_in_cams)}")
         
         tf_to_center = np.eye(4)
-        # ob_centered_in_cams = ob_in_cams
         mesh_centered = mesh
 
-        
         if not self.cfg.use_normal:
             normal_map = None
 
@@ -267,7 +264,6 @@ class PoseRefinePredictor:
     
         bs = 1024
 
-        # B_in_cams = torch.as_tensor(ob_centered_in_cams, device='cuda', dtype=torch.float)
         B_in_cams = ob_in_cams
         if mesh_tensors is None:
             mesh_tensors = make_mesh_tensors(mesh_centered)
@@ -284,20 +280,32 @@ class PoseRefinePredictor:
             start_iter = time.time()
             torch.cuda.synchronize()
             start_crop = time.time()
+            
             pose_data = make_crop_data_batch(
                 self.cfg.input_resize, B_in_cams, mesh_centered, rgb_tensor, depth_tensor, K,
                 crop_ratio=crop_ratio, normal_map=normal_map, xyz_map=xyz_map_tensor, cfg=self.cfg,
                 glctx=glctx, mesh_tensors=mesh_tensors, dataset=self.dataset, mesh_diameter=mesh_diameter
             )
+            
             torch.cuda.synchronize()
             end_crop = time.time()
-            # logging.info(f"Time for cropping data: {end_crop - start_crop:.4f} seconds")
+
+            # ================= 🌟 [时序模块保留区] 级联策略 =================
+            # if getattr(self, 'use_temporal', False) and getattr(self, 'anchor_B', None) is not None and iter_idx == 0:
+            #     B_prev_all = torch.cat([
+            #         self.anchor_B.expand(pose_data.rgbBs.shape[0], -1, -1, -1), 
+            #         self.anchor_xyz.expand(pose_data.xyz_mapBs.shape[0], -1, -1, -1)
+            #     ], dim=1).float()
+            # else:
+            #     B_prev_all = torch.cat([pose_data.rgbBs, pose_data.xyz_mapBs], dim=1).float()
+            # ==============================================================================
             
-            B_in_cams = []
+            B_in_cams_list = []
             for b in range(0, pose_data.rgbAs.shape[0], bs):
                 A = torch.cat([pose_data.rgbAs[b:b+bs].cuda(), pose_data.xyz_mapAs[b:b+bs].cuda()], dim=1).float()
                 B = torch.cat([pose_data.rgbBs[b:b+bs].cuda(), pose_data.xyz_mapBs[b:b+bs].cuda()], dim=1).float()
-    
+                
+                # B_prev_batch = B_prev_all[b:b+bs].cuda()  # [时序模块保留区]
                 
                 if USE_TRT:
                     if A.shape[0]==1:
@@ -307,6 +315,7 @@ class PoseRefinePredictor:
                 else:
                     with torch.cuda.amp.autocast(enabled=self.amp):
                         output = self.model(A,B)
+                        # output = self.model(A, B, B_prev_batch)  # [时序模块保留区] 三输入前向传播
 
                 for k in output:
                     output[k] = output[k].float()
@@ -350,17 +359,28 @@ class PoseRefinePredictor:
                 B_in_cam = egocentric_delta_pose_to_pose(
                     pose_data.poseA[b:b+bs], trans_delta=trans_delta, rot_mat_delta=rot_mat_delta
                 )
-                B_in_cams.append(B_in_cam)
+                B_in_cams_list.append(B_in_cam)
 
-            B_in_cams = torch.cat(B_in_cams, dim=0).reshape(len(ob_in_cams), 4, 4)
+            B_in_cams = torch.cat(B_in_cams_list, dim=0).reshape(len(ob_in_cams), 4, 4)
             
         B_in_cams_out = B_in_cams @ torch.tensor(tf_to_center[None], device='cuda', dtype=torch.float)
+        
+        # ================= 🌟 [时序模块保留区] 提取绝对居中的锚点 =================
+        # if B_in_cams_out.shape[0] == 1:
+        #     final_pose_data = make_crop_data_batch(
+        #         self.cfg.input_resize, B_in_cams_out, mesh_centered, rgb_tensor, depth_tensor, K,
+        #         crop_ratio=crop_ratio, normal_map=normal_map, xyz_map=xyz_map_tensor, cfg=self.cfg,
+        #         glctx=glctx, mesh_tensors=mesh_tensors, dataset=self.dataset, mesh_diameter=mesh_diameter
+        #     )
+        #     self.anchor_B = final_pose_data.rgbBs.clone().detach()
+        #     self.anchor_xyz = final_pose_data.xyz_mapBs.clone().detach()
+        # =====================================================================
+
         torch.cuda.empty_cache()
         self.last_trans_update = trans_delta
         self.last_rot_update = rot_mat_delta
 
         return B_in_cams_out, None
-
 
 
     @torch.inference_mode()

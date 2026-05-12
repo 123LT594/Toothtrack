@@ -69,7 +69,6 @@ class FoundationPose:
         self.pose_last = None  # Used for tracking; per the centered mesh
 
     def reset_object(self, model_pts, model_normals, symmetry_tfs=None, mesh=None):
-        # 统一使用tools.py中的compute_mesh_center函数，确保一致性
         from .tools import compute_mesh_center
         self.model_center = compute_mesh_center(mesh)
         if mesh is not None:
@@ -77,38 +76,34 @@ class FoundationPose:
             mesh = mesh.copy()
             mesh.vertices = mesh.vertices - self.model_center.reshape(1, 3)
         model_pts = mesh.vertices
-        self.diameter = compute_mesh_diameter(model_pts=mesh.vertices, n_sample=10000)
+        
+        from .tools import compute_mesh_diameter
+        self.diameter = compute_mesh_diameter(mesh)  # 🌟 修复了传参 Bug
+        
         self.vox_size = max(self.diameter / 20.0, 0.003)
-        # 模型直径和体素大小信息不输出
         self.dist_bin = self.vox_size / 2
         self.angle_bin = 20  # Deg
-        pcd = toOpen3dCloud(model_pts, normals=model_normals)
-        pcd = pcd.voxel_down_sample(self.vox_size)
-        self.max_xyz = np.asarray(pcd.points).max(axis=0)
-        self.min_xyz = np.asarray(pcd.points).min(axis=0)
-        self.pts = torch.tensor(
-            np.asarray(pcd.points), dtype=torch.float32, device="cuda"
-        )
-        self.normals = F.normalize(
-            torch.tensor(np.asarray(pcd.normals), dtype=torch.float32, device="cuda"),
-            dim=-1,
-        )
-        # 点云形状信息不输出
+        
+        # ================= 🌟 纯 Numpy 安全体素降采样 =================
+        pts_np = np.asarray(model_pts)
+        normals_np = np.asarray(model_normals)
+        voxel_coords = np.round(pts_np / self.vox_size).astype(np.int32)
+        _, unique_indices = np.unique(voxel_coords, axis=0, return_index=True)
+        ds_pts = pts_np[unique_indices]
+        ds_normals = normals_np[unique_indices]
+        
+        self.max_xyz = ds_pts.max(axis=0)
+        self.min_xyz = ds_pts.min(axis=0)
+        self.pts = torch.tensor(ds_pts, dtype=torch.float32, device="cuda")
+        self.normals = F.normalize(torch.tensor(ds_normals, dtype=torch.float32, device="cuda"), dim=-1)
+        # =========================================================================    
         self.mesh_path = None
         self.mesh = mesh
-        # if self.mesh is not None:
-        #   self.mesh_path = f'/tmp/{uuid.uuid4()}.obj'
-        #   self.mesh.export(self.mesh_path)
         self.mesh_tensors = make_mesh_tensors(self.mesh)
-
         if symmetry_tfs is None:
             self.symmetry_tfs = torch.eye(4).float().cuda()[None]
         else:
-            self.symmetry_tfs = torch.as_tensor(
-                symmetry_tfs, device="cuda", dtype=torch.float
-            )
-
-        # reset done信息不输出
+            self.symmetry_tfs = torch.as_tensor(symmetry_tfs, device="cuda", dtype=torch.float)
 
     def get_tf_to_centered_mesh(self):
         tf_to_center = torch.eye(4, dtype=torch.float, device="cuda")
@@ -940,11 +935,11 @@ class FoundationPose:
                 pose.cpu().numpy(), self.mesh, K, w=rgb.shape[0], h=rgb.shape[1]
             )
             
-            if 0.8*np.sum(mask)>np.sum(gt_mask):
-                print("tracking is not good as  it is too far")
-                self.track_good = False
-                measurement[2]=measurement[2]*0.9
-                self.tracker.update(measurement)
+            # if 0.8*np.sum(mask)>np.sum(gt_mask):
+            #     print("tracking is not good as  it is too far")
+            #     self.track_good = False
+            #     measurement[2]=measurement[2]*0.9
+            #     self.tracker.update(measurement)
 
     
             # if np.sum(mask)<0.6*np.sum(gt_mask):

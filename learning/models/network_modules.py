@@ -110,6 +110,34 @@ class ResnetBasicBlock(nn.Module):
 
     return out
 
+class DeformableCrossAttention(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.dim = channels
+        self.offset_net = nn.Sequential(
+            nn.Conv2d(channels * 2, channels // 2, kernel_size=3, padding=1),
+            nn.BatchNorm2d(channels // 2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels // 2, 2, kernel_size=3, padding=1)
+        )
+        self.attn = nn.MultiheadAttention(embed_dim=self.dim, num_heads=4, batch_first=True)
+        self.norm = nn.LayerNorm(self.dim)
+        self.gamma = nn.Parameter(torch.tensor([0.0]))
+        
+    def forward(self, curr_feat, ref_feat):
+        B, C, H, W = curr_feat.shape
+        cat_feat = torch.cat([curr_feat, ref_feat], dim=1)
+        offsets = self.offset_net(cat_feat) 
+        grid_y, grid_x = torch.meshgrid(torch.linspace(-1, 1, H, device=curr_feat.device), 
+                                        torch.linspace(-1, 1, W, device=curr_feat.device), indexing='ij')
+        grid = torch.stack((grid_x, grid_y), dim=-1).unsqueeze(0).expand(B, -1, -1, -1)
+        deformed_grid = grid + offsets.permute(0, 2, 3, 1) 
+        aligned_ref = F.grid_sample(ref_feat, deformed_grid, mode='bilinear', padding_mode='zeros', align_corners=True)
+        query = curr_feat.view(B, C, -1).permute(0, 2, 1)
+        key_value = aligned_ref.view(B, C, -1).permute(0, 2, 1)
+        attn_out, attn_w = self.attn(query, key_value, key_value)
+        res = self.norm(attn_out).permute(0, 2, 1).view(B, C, H, W)
+        return curr_feat + self.gamma * res, offsets, attn_w
 
 
 class PositionalEmbedding(nn.Module):

@@ -17,41 +17,25 @@ RGB_SRC = os.path.join(SRC_DIR, "rgb")
 DEPTH_SRC = os.path.join(SRC_DIR, "depth")
 POSE_SRC = os.path.join(SRC_DIR, "pose")
 
-# 筛选阈值 (单位: 像素, 540p 尺度)
+# 你的标准阈值：1.5px（540p纯正尺度）
 ERROR_THRESHOLD = 1.5
 
-# 只创建训练真正需要的 rgb 和 depth 目录！坚决不要 pose！
-for sub in ["rgb", "depth"]:
+# 创建三个目录
+for sub in ["rgb", "depth", "pose"]:
     os.makedirs(os.path.join(DST_DIR, sub), exist_ok=True)
 # ==========================================
 
 def get_ball_centroids():
-    """保留你原汁原味的按顺序读取逻辑"""
     centroids = []
     for i in range(1, 5):
         mesh_path = os.path.join(MESH_DIR, f"{i}.obj")
-        if not os.path.exists(mesh_path):
-            raise FileNotFoundError(f"找不到钢珠模型: {mesh_path}")
         m = trimesh.load(mesh_path, process=False)
         centroids.append(m.vertices.mean(axis=0))
     return np.array(centroids, dtype=np.float64)
 
-def calculate_reprojection_error(pts_3d, pts_2d, pose, K):
-    """理想小孔成像，移除畸变参数"""
-    R = pose[:3, :3]
-    t = pose[:3, 3]
-    rvec, _ = cv2.Rodrigues(R)
-    
-    # 畸变参数设为 None
-    proj_pts, _ = cv2.projectPoints(pts_3d, rvec, t, K, None)
-    proj_pts = proj_pts.squeeze()
-    
-    errors = np.linalg.norm(proj_pts - pts_2d, axis=1)
-    return np.mean(errors)
-
 def main():
     pts_3d = get_ball_centroids()
-    K = np.loadtxt(K_PATH)
+    K = np.loadtxt(K_PATH, dtype=np.float64)
     
     with open(ANN_PATH, 'r') as f:
         full_data = json.load(f)
@@ -74,27 +58,37 @@ def main():
             
         frame_data = annotations[img_name]
         try:
-            pts_2d_orig = np.array([frame_data[f"ball_{i}"] for i in range(1, 5)], dtype=np.float64)
-            # 🌟 保留这个数学命门：JSON 是 1080p，K 矩阵是 540p，必须降维对齐！
-            pts_2d_540 = pts_2d_orig * 0.5
+            pts_2d = np.array([frame_data[f"ball_{i}"] for i in range(1, 5)], dtype=np.float64)
         except (KeyError, TypeError):
             continue
 
+        # 读取pose
         pose = np.load(pose_path)
-        error = calculate_reprojection_error(pts_3d, pts_2d_540, pose, K)
+        R = pose[:3, :3]
+        t = pose[:3, 3]
+        rvec, _ = cv2.Rodrigues(R)
+        
+        # 正确重投影
+        proj_pts, _ = cv2.projectPoints(pts_3d, rvec, t, K, None)
+        proj_pts = proj_pts.squeeze()
+        error = np.mean(np.linalg.norm(proj_pts - pts_2d, axis=1))
+        
         total_valid += 1
 
-        # 筛选与转移
+        # 筛选通过，复制三个文件
         if error <= ERROR_THRESHOLD:
             golden_count += 1
             shutil.copy2(os.path.join(RGB_SRC, img_name), os.path.join(DST_DIR, "rgb", img_name))
             shutil.copy2(depth_path, os.path.join(DST_DIR, "depth", f"{base_name}.npy"))
+            shutil.copy2(pose_path, os.path.join(DST_DIR, "pose", f"{base_name}.npy"))
 
-    print("\n" + "="*40)
-    print(f"📊 黄金训练集提取完毕！")
-    print(f"   - 共提取: {golden_count} 帧 (仅含 rgb 与 depth)")
-    print(f"   - 目的地: {DST_DIR}")
-    print("="*40)
+    print("\n" + "="*50)
+    print(f"✅ 黄金训练集提取完毕！")
+    print(f"   有效总帧数：{total_valid}")
+    print(f"   筛选黄金帧：{golden_count}")
+    print(f"   输出目录：{DST_DIR}")
+    print("   包含：rgb / depth / pose")
+    print("="*50)
 
 if __name__ == "__main__":
     main()
