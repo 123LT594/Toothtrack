@@ -139,7 +139,7 @@ if __name__ == "__main__":
     ])
 
     # 🌟 核心修改 1：100% 全量数据出击！干掉验证集划分
-    train_ds = JointDataset('../golden_dataset', train_tf)
+    train_ds = JointDataset('/root/lanyun-tmp/golden_dataset', train_tf)
     print(f"🔥 使用 100% 全量数据：共 {len(train_ds)} 帧")
     
     train_loader = DataLoader(train_ds, batch_size=4, shuffle=True, num_workers=4, pin_memory=True) 

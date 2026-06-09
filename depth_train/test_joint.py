@@ -72,7 +72,7 @@ class DecoupledMultiTaskUNet(nn.Module):
 def test_joint():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     input_dir = "../demo_data/tooth/rgb"
-    out_mask = "test_results_joint_decoupled/mask"   # 改了一下输出文件夹，防止和旧版混淆
+    out_mask = "test_results_joint_decoupled/mask"   
     out_depth = "test_results_joint_decoupled/depth"
     os.makedirs(out_mask, exist_ok=True)
     os.makedirs(out_depth, exist_ok=True)
@@ -83,7 +83,7 @@ def test_joint():
     model.eval()
 
     files = sorted([f for f in os.listdir(input_dir) if f.endswith('.png')])
-    print(f"🚀 解耦架构联合推理启动，共 {len(files)} 帧...")
+    print(f"🚀 解耦架构联合推理启动，带绝对深度监控，共 {len(files)} 帧...")
 
     with torch.no_grad():
         for f in tqdm(files, desc="Joint 推理中", unit="帧"):
@@ -112,26 +112,37 @@ def test_joint():
                 
             cv2.imwrite(os.path.join(out_mask, f), final_mask_bin * 255)
             
-            # ================= [处理 Depth] =================
+            # ================= [处理 Depth & 终端监控] =================
             depth_crop = depth_pred.squeeze().cpu().numpy()[:h, :w]
             
             if final_mask_bin.max() == 0:
                 cv2.imwrite(os.path.join(out_depth, f), np.zeros((h, w), dtype=np.uint8))
+                tqdm.write(f"⚠️ {f} | 绝对深度范围: 未检测到目标")
                 continue
             
             depth_crop = depth_crop * final_mask_bin
-            v = depth_crop[final_mask_bin > 0]
             
-            if len(v) > 0 and v.max() > v.min():
+            # 🌟 核心：为了获取真实的中心有效深度，侵蚀掉 Mask 边缘 5 个像素，防止拿到平滑过渡值
+            eroded_mask = cv2.erode(final_mask_bin, np.ones((5,5), np.uint8))
+            v_valid = depth_crop[eroded_mask > 0]
+            
+            if len(v_valid) > 0 and v_valid.max() > v_valid.min():
+                # 安全输出终端深度范围
+                d_min = v_valid.min()
+                d_max = v_valid.max()
+                tqdm.write(f"✅ {f} | 绝对深度范围: {d_min:.4f}m ~ {d_max:.4f}m")
+                
                 # 黑坑白牙归一化 -> 反转为白坑黑牙 -> 背景归零
+                v = depth_crop[final_mask_bin > 0] # 可视化拉伸还是用全量有效像素
                 norm = (depth_crop - v.min()) / (v.max() - v.min()) * 255
                 vis = (norm * final_mask_bin).astype(np.uint8)
                 depth_grayscale_final = ((255 - vis) * final_mask_bin).astype(np.uint8)
                 cv2.imwrite(os.path.join(out_depth, f), depth_grayscale_final)
             else:
                 cv2.imwrite(os.path.join(out_depth, f), np.zeros((h, w), dtype=np.uint8))
+                tqdm.write(f"⚠️ {f} | 绝对深度范围: 深度值异常")
 
-    print(f"\n✅ 测试完成！请去 test_results_joint_decoupled 目录下验收图纸。")
+    print(f"\n✅ 测试完成！去对比全景模型和裁剪模型的物理深度差异吧！")
 
 if __name__ == "__main__":
     test_joint()

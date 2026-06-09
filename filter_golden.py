@@ -17,8 +17,8 @@ RGB_SRC = os.path.join(SRC_DIR, "rgb")
 DEPTH_SRC = os.path.join(SRC_DIR, "depth")
 POSE_SRC = os.path.join(SRC_DIR, "pose")
 
-# 你的标准阈值：1.5px（540p纯正尺度）
-ERROR_THRESHOLD = 1.5
+# 你的标准阈值：2.0px（540p纯正尺度）
+ERROR_THRESHOLD = 2.0
 
 # 创建三个目录
 for sub in ["rgb", "depth", "pose"]:

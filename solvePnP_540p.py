@@ -93,10 +93,10 @@ def main():
             proj_b, _ = cv2.projectPoints(kpts_3d, rvec, tvec, K_540, None)
             error = np.mean(np.linalg.norm(pts_2d_540 - proj_b.squeeze(), axis=1))
             
-            if error > 1.5:
+            if error > 2.0:
                 tqdm.write(f"⚠️  High Error: {frame_name} | {error:.2f} px (540p scale)")
                 bad_count += 1
-            elif error <= 1.5:
+            elif error <= 2.0:
                 gold_errors.append(error)
             
             # ✅ 位姿：保存为安全的 float32
@@ -130,10 +130,10 @@ def main():
 
     print("\n" + "="*50)
     print(f"✅ 处理完毕！")
-    print(f"📊 总处理帧数: {total_processed} | 黄金帧 (误差 <= 1.5px): {gold_count}")
+    print(f"📊 总处理帧数: {total_processed} | 黄金帧 (误差 <= 2px): {gold_count}")
     print(f"✨ 黄金帧平均误差: {avg_gold_err:.4f} px (540p尺度)")
     print(f"📏 黄金帧中位数误差: {med_gold_err:.4f} px (540p尺度)")
-    print(f"❌ 高误差帧 (误差 > 1.5px): {bad_count}")
+    print(f"❌ 高误差帧 (误差 > 2px): {bad_count}")
     print("="*50)
 
 if __name__ == "__main__":
