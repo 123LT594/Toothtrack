@@ -1,4 +1,4 @@
-#最终版，去掉了 Sigmoid，结合相机内参K，直接回归物理度量
+#最终版，利用真实的相机内参 K，直接回归物理度量
 import os
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 os.environ["HF_HUB_OFFLINE"] = "0"

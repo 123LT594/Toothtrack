@@ -69,7 +69,7 @@ def test_ablation_transformer():
 
     print("🚀 加载【无基尼消融版】物理对齐模型...")
     model = SwinMultiTaskUNet().to(device)
-    model.load_state_dict(torch.load("/root/lanyun-tmp/models/models_joint_physi/joint_best.pth", map_location=device))
+    model.load_state_dict(torch.load("/root/lanyun-tmp/models/models_joint_physical/joint_best.pth", map_location=device))
     model.eval()
 
     files = sorted([f for f in os.listdir(input_dir) if f.endswith('.png')])

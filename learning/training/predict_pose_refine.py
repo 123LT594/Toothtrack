@@ -15,7 +15,6 @@ from utils.datareader import *
 from learning.models.tensorrt_models import RefineNetTrt
 USE_TRT =False
 
-
 @torch.inference_mode()
 def make_crop_data_batch(render_size, ob_in_cams, mesh, rgb, depth, K, crop_ratio, xyz_map, normal_map=None, mesh_diameter=None, cfg=None, glctx=None, mesh_tensors=None, dataset=None):
     H, W = depth.shape[:2]
@@ -290,15 +289,6 @@ class PoseRefinePredictor:
             torch.cuda.synchronize()
             end_crop = time.time()
 
-            # ================= 🌟 [时序模块保留区] 级联策略 =================
-            # if getattr(self, 'use_temporal', False) and getattr(self, 'anchor_B', None) is not None and iter_idx == 0:
-            #     B_prev_all = torch.cat([
-            #         self.anchor_B.expand(pose_data.rgbBs.shape[0], -1, -1, -1), 
-            #         self.anchor_xyz.expand(pose_data.xyz_mapBs.shape[0], -1, -1, -1)
-            #     ], dim=1).float()
-            # else:
-            #     B_prev_all = torch.cat([pose_data.rgbBs, pose_data.xyz_mapBs], dim=1).float()
-            # ==============================================================================
             
             B_in_cams_list = []
             for b in range(0, pose_data.rgbAs.shape[0], bs):
@@ -365,16 +355,7 @@ class PoseRefinePredictor:
             
         B_in_cams_out = B_in_cams @ torch.tensor(tf_to_center[None], device='cuda', dtype=torch.float)
         
-        # ================= 🌟 [时序模块保留区] 提取绝对居中的锚点 =================
-        # if B_in_cams_out.shape[0] == 1:
-        #     final_pose_data = make_crop_data_batch(
-        #         self.cfg.input_resize, B_in_cams_out, mesh_centered, rgb_tensor, depth_tensor, K,
-        #         crop_ratio=crop_ratio, normal_map=normal_map, xyz_map=xyz_map_tensor, cfg=self.cfg,
-        #         glctx=glctx, mesh_tensors=mesh_tensors, dataset=self.dataset, mesh_diameter=mesh_diameter
-        #     )
-        #     self.anchor_B = final_pose_data.rgbBs.clone().detach()
-        #     self.anchor_xyz = final_pose_data.xyz_mapBs.clone().detach()
-        # =====================================================================
+
 
         torch.cuda.empty_cache()
         self.last_trans_update = trans_delta

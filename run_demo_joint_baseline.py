@@ -16,7 +16,6 @@ from utils.estimater import *
 from utils.datareader import *
 from utils.tools import *
 from utils.render_3d import create_visualization
-# 确保你已经把类名改成了与训练脚本一致的 SwinMultiTaskUNet
 from utils.depth_model_joint import SwinMultiTaskUNet
 
 class SuppressPrint:
@@ -32,7 +31,7 @@ if __name__ == "__main__":
     code_dir = os.path.dirname(os.path.realpath(__file__))
     parser.add_argument("--mesh_file", type=str, default=f"{code_dir}/demo_data/tooth/mesh/tooth.obj")
     parser.add_argument("--test_scene_dir", type=str, default=f"{code_dir}/demo_data/tooth")
-    parser.add_argument("--track_refine_iter", type=int, default=2) 
+    parser.add_argument("--track_refine_iter", type=int, default=1) 
     
     parser.add_argument("--weight_physical", type=str, default="/root/lanyun-tmp/models/models_joint_physical/joint_best.pth")
     args = parser.parse_args()
@@ -84,6 +83,8 @@ if __name__ == "__main__":
     try:
         for i in range(len(reader.color_files)):
             color, frame_name, H, W = reader.get_color(i), reader.id_strs[i] + ".png", reader.get_color(i).shape[0], reader.get_color(i).shape[1]
+            # 🌟 1. 同步 GPU 并计时起点
+            torch.cuda.synchronize()
             t1 = time.time()
             
             with torch.no_grad():
@@ -122,6 +123,8 @@ if __name__ == "__main__":
                 else:
                     pose = est.track_one(rgb=color, depth=current_depth, K=reader.K, iteration=args.track_refine_iter) @ est.get_tf_to_centered_mesh().data.cpu().numpy().reshape(4, 4)
                     
+            # 🌟 3. 同步 GPU 并计时终点
+            torch.cuda.synchronize()
             t2 = time.time()
             vis = create_visualization(color, pose, to_origin, reader.K, bbox, fps=1/(t2-t1), render_3d=True, mesh_dir=os.path.dirname(args.mesh_file), main_mesh=mesh, center_pose=pose @ np.linalg.inv(to_origin))
             
