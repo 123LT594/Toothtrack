@@ -54,7 +54,7 @@ class SwinMultiTaskUNet(nn.Module):
 def test_ablation_transformer():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    input_dir = "/root/Toothtrack/demo_data/tooth/rgb"
+    input_dir = "/root/lanyun-tmp/resized_frames"
     gt_depth_dir = "/root/lanyun-tmp/golden_dataset/depth"
     
     out_mask = "test_results_physical/mask"
