@@ -77,31 +77,16 @@ class RefineNet(nn.Module):
                 nn.Linear(512, rot_out_dim),
         )
 
-    # def forward(self, A_render, B_curr, B_prev):
-    #     bs = A_render.shape[0]
-    #     output = {}
-
-    #     # 1. 共享权重提取特征
-    #     x = torch.cat([A_render, B_curr, B_prev], dim=0)
-    #     x = self.encodeA(x)
-        
-    #     a_render = x[:bs]         # Rendered (CAD图)
-    #     b_curr = x[bs:2*bs]       # Real_curr (当前真实图)
-    #     b_prev = x[2*bs:3*bs]     # Real_prev (历史真实图)
-
-    #     # 2. 🌟 时序融合只在真实图像之间进行！(物理正确)
-    #     b_fused, _, _ = self.temporal_attn(curr_feat=b_curr, ref_feat=b_prev)
-
-    #     # 3. 🌟 致命修正：拼接顺序必须严格为 (Rendered, Real)！(权重对齐)
-    #     ab = torch.cat((a_render, b_fused), 1).contiguous()
-        
-    #     ab = self.encodeAB(ab)
-    #     ab = self.pos_embed(ab.reshape(bs, ab.shape[1], -1).permute(0,2,1))
-    #     output['trans'] = self.trans_head(ab).mean(dim=1)
-    #     output['rot'] = self.rot_head(ab).mean(dim=1)
-
-    #     return output
-
+    #新增  ==========================================================   
+    def extract_distill_feature(self, A):
+        """
+        真实的非侵入式特征截取。
+        A: (B, 6, H, W) 包含了 RGB (3) + XYZ (3)
+        """
+        with torch.no_grad():
+            feat = self.encodeA(A)
+            return feat
+    # ==========================================================
     def forward(self, A, B):
         """
         @A: (B,C,H,W)

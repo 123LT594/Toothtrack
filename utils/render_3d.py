@@ -4,6 +4,7 @@ import numpy as np
 import cv2
 import trimesh
 import os
+import logging
 from typing import Tuple, Optional, List
 
 

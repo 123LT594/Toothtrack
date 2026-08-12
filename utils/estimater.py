@@ -456,6 +456,9 @@ class FoundationPose:
         add_errs = self.compute_add_err_to_gt_pose(poses)
         ids = torch.as_tensor(scores).argsort(descending=True)
         # logging.info(f'sort ids:{ids}')
+        # ================= 🌟 核心拦截：保存 Top-5 =================
+        self.top5_poses = poses[ids[:5]].detach().clone()
+        # ==========================================================
         scores = scores[ids]
         poses = poses[ids]
 
@@ -602,6 +605,9 @@ class FoundationPose:
 
         ids = torch.as_tensor(scores).argsort(descending=True)
         # logging.info(f'sort ids:{ids}')
+        # ================= 🌟 核心拦截：保存 Top-5 =================
+        self.top5_poses = poses[ids[:5]].detach().clone()
+        # ==========================================================
         scores = scores[ids]
         poses = poses[ids]
         best_pose = poses[0] @ self.get_tf_to_centered_mesh()
