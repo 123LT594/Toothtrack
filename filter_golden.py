@@ -7,8 +7,8 @@ import shutil
 from tqdm import tqdm
 
 # ================= 配置区 =================
-SRC_DIR = "./demo_data/tooth_gt"
-DST_DIR = "../lanyun-tmp/golden_dataset"
+SRC_DIR = "./demo_data/wxb"
+DST_DIR = "../lanyun-tmp/wxb_golden_dataset"
 
 MESH_DIR = os.path.join(SRC_DIR, "mesh")
 K_PATH = os.path.join(SRC_DIR, "cam_K.txt")

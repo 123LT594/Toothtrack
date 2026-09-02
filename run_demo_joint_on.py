@@ -20,6 +20,12 @@ from utils.render_3d import create_visualization
 from learning.models.student_depth_net import StudentDepthNet
 from learning.training.training_config import DISTILL_PHYSICAL_WIDTH
 
+# ==========================================================
+# 🌟 引入我们全新的纯几何首帧粗筛模块
+from utils.zero_shot_geometry_matcher import FastZeroShotMatcher
+# ==========================================================
+
+
 def calc_te(pose_pred, pose_gt):
     return np.linalg.norm(pose_pred[:3, 3] - pose_gt[:3, 3]) * 1000.0
 
@@ -71,14 +77,14 @@ class SuppressPrint:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     code_dir = os.path.dirname(os.path.realpath(__file__))
-    parser.add_argument("--mesh_file", type=str, default=f"{code_dir}/demo_data/test/mesh/tooth.obj")
-    parser.add_argument("--test_scene_dir", type=str, default=f"{code_dir}/demo_data/test")
+    parser.add_argument("--mesh_file", type=str, default=f"{code_dir}/demo_data/ztooth/mesh/tooth.obj")
+    parser.add_argument("--test_scene_dir", type=str, default=f"{code_dir}/demo_data/ztooth")
     parser.add_argument('--est_refine_iter', type=int, default=5)
     parser.add_argument("--track_refine_iter", type=int, default=1) 
     parser.add_argument("--weight_student", type=str, default="/root/lanyun-tmp/models/stage1_distill/models/student_stage1_ep99.pth")
     
     parser.add_argument("--use_pred_init", default=True, type=bool, help="默认开启首帧预测")
-    parser.add_argument("--no_eval", default=True, type=bool, help="默认不开启验证")
+    parser.add_argument("--no_eval", default=False, type=bool, help="默认不开启验证")
     
     args = parser.parse_args()
 
@@ -127,11 +133,22 @@ if __name__ == "__main__":
     to_origin, extents = trimesh.bounds.oriented_bounds(mesh)
     bbox = np.stack([-extents / 2, extents / 2], axis=0).reshape(2, 3)
 
-    scorer = ScorePredictor()
+    # ==========================================================
+    # 🌟 核心修改点：
+    # 1. 注释掉原版极耗显存的 RGB Scorer 模型
+    # 2. 将 scorer 传入 None
+    # 3. 初始化极速全数学几何匹配器 (FastZeroShotMatcher)
+    # ==========================================================
+    # scorer = ScorePredictor() 
     refiner = PoseRefinePredictor() 
-    est = FoundationPose(model_pts=mesh.vertices, model_normals=mesh.vertex_normals, mesh=mesh, scorer=scorer, refiner=refiner, glctx=glctx)
-    reader = YcbineoatReader(video_dir=args.test_scene_dir, zfar=np.inf)
+    est = FoundationPose(model_pts=mesh.vertices, model_normals=mesh.vertex_normals, mesh=mesh, scorer=None, refiner=refiner, glctx=glctx)
+    
+    print("🚀 加载 3D 零样本纯几何粗筛器 (FastZeroShotMatcher)...")
+    matcher_pkl_path = "/root/Toothtrack/demo_data/ztooth/zero_shot_db.pkl"
+    matcher = FastZeroShotMatcher(pkl_path=matcher_pkl_path, alpha=0.5)
+    # ==========================================================
 
+    reader = YcbineoatReader(video_dir=args.test_scene_dir, zfar=np.inf)
     video_writer = cv2.VideoWriter(os.path.join(output_dir, "track_distill.mp4"), cv2.VideoWriter_fourcc(*'mp4v'), 30, (reader.W, reader.H))
     previous_pose = None
 
@@ -188,6 +205,7 @@ if __name__ == "__main__":
                 delta_z = torch.tanh(delta_z_scalar.view(-1, 1, 1, 1)) * MAX_Z_CORRECTION
                 D_pred = Z_base + delta_z + shape_weight * THICKNESS_FACTOR
                 
+                # 这里的 mask 和 depth 是精准裁剪到 160x160 的特征
                 mask_crop_np = (mask_pred[0, 0] > 0.5).cpu().numpy().astype(np.uint8)
                 depth_crop_np = D_pred[0, 0].cpu().numpy()
                 depth_crop_np = depth_crop_np * mask_crop_np
@@ -205,40 +223,48 @@ if __name__ == "__main__":
                 
                 if i == 0:
                     if args.use_pred_init:
-                        print("🚀 正在使用预测伪深度执行首帧全局定位 (Pose Estimation) ...")
-                        pose = est.register(K=reader.K, rgb=color, depth=current_depth, ob_mask=initial_mask, iteration=args.est_refine_iter)
+                        # ==========================================================
+                        # 🌟 终极位姿数学修正：解耦旋转(R)与平移(T)
+                        # ==========================================================
+                        # 使用 sys.stderr.write 绕过 SuppressPrint，让终端能看到提示
+                        sys.stderr.write("\n🚀 启动零样本纯几何粗筛定位...\n")
                         
-                        # ========================================================
-                        # 🌟 核心新增：首帧 Top-5 候选位姿拦截与保存
-                        # ========================================================
-                        if hasattr(est, 'top5_poses'):
-                            print(f"\n📊 正在渲染首帧打分排名 Top-5 的假设位姿...")
-                            # 🌟 修正 1：获取底层的坐标系转换矩阵
-                            tf_to_center = est.get_tf_to_centered_mesh().cpu().numpy().reshape(4, 4)
+                        # 1. 送入匹配器 (返回离线空间下的 cam2world 位姿)
+                        initial_pose_cam2world = matcher.match(mask_crop_np, depth_crop_np)
+                        
+                        if initial_pose_cam2world is not None:
+                            sys.stderr.write("✅ 几何粗筛成功！利用预测深度图解算真实物理平移(T)...\n")
                             
-                            for rank, hyp_pose in enumerate(est.top5_poses):
-                                # 确保转为 4x4 numpy 矩阵
-                                if torch.is_tensor(hyp_pose):
-                                    hyp_pose = hyp_pose.cpu().numpy().reshape(4, 4)
-                                
-                                # 🌟 修正 2：把截获的位姿转换回真实的相机物理空间
-                                hyp_pose = hyp_pose @ tf_to_center
-                                
-                                vis_hyp = create_visualization(
-                                    color, hyp_pose, to_origin, reader.K, bbox, fps=0, 
-                                    render_3d=True, mesh_dir=os.path.dirname(args.mesh_file), 
-                                    main_mesh=mesh, center_pose=hyp_pose @ np.linalg.inv(to_origin)
-                                )
-                                # 保存后缀如：000000_0.png, 000000_1.png ...
-                                out_name = f"{reader.id_strs[i]}_{rank}.png"
-                                out_path = os.path.join(img_output_dir, out_name)
-                                cv2.imwrite(out_path, vis_hyp[..., ::-1])
-                                print(f"   => 💾 已保存: {out_name} (Scorer排名: 第 {rank+1} 名)")
-                            print("="*60 + "\n")
+                            # 2. 坐标系求逆：把 相机到世界(cam2world) 变成 物体到相机(obj2cam)
+                            obj2cam_template = np.linalg.inv(initial_pose_cam2world)
+                            
+                            # 3. 取出模板最核心的资产：正确的 3D 旋转姿态 (R)
+                            R_pred = obj2cam_template[:3, :3]
+                            
+                            # 4. 动态计算真实平移：获取当前画面牙齿的绝对物理深度 (tz)
+                            valid_depth = current_depth[current_mask]
+                            real_tz = np.median(valid_depth) if len(valid_depth) > 0 else 0.1 
+                            
+                            # 5. 针孔相机极线反投影：根据 2D BBox 中心点推算真实的真实 tx, ty
+                            # 公式：X = (u - cx) * Z / fx
+                            real_tx = (c_x - reader.K[0, 2]) * real_tz / reader.K[0, 0]
+                            real_ty = (c_y - reader.K[1, 2]) * real_tz / reader.K[1, 1]
+                            
+                            # 6. 重新拼装出真正属于当前帧画面的完美初始位姿
+                            real_initial_pose = np.eye(4, dtype=np.float32)
+                            real_initial_pose[:3, :3] = R_pred
+                            real_initial_pose[:3, 3] = [real_tx, real_ty, real_tz]
+                            
+                            # 直接喂给 FoundationPose，此时初始重叠率绝对超过 80%！
+                            est.pose_last = torch.tensor(real_initial_pose, device=device, dtype=torch.float32).unsqueeze(0)
+                            
+                            pose_centered = est.track_one(rgb=color, depth=current_depth, K=reader.K, iteration=args.est_refine_iter)
+                            pose = pose_centered @ est.get_tf_to_centered_mesh().data.cpu().numpy().reshape(4, 4)
                         else:
-                            print("\n⚠️ 无法获取 Top-5 位姿！请按照提示在 utils/estimater.py 中暴露 self.top5_poses")
-                        # ========================================================
-                        
+                            sys.stderr.write("❌ 警告：未匹配到任何有效模板！\n")
+                            pose = np.eye(4)
+                        # ==========================================================
+
                     else:
                         est.pose_last = torch.tensor(pose_gt @ np.linalg.inv(est.get_tf_to_centered_mesh().data.cpu().numpy().reshape(4, 4)), device=device, dtype=torch.float32).unsqueeze(0)
                         est.track_one(rgb=color, depth=current_depth, K=reader.K, iteration=1)

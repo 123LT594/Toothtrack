@@ -9,7 +9,7 @@ import pyrender
 from tqdm import tqdm
 
 # ================= 配置：路径直接指向 tooth_gt =================
-DATA_DIR = "./demo_data/tooth_gt"
+DATA_DIR = "./demo_data/wxb"
 
 MESH_TOOTH = os.path.join(DATA_DIR, "mesh/tooth.obj")
 BALL_FILES = [os.path.join(DATA_DIR, f"mesh/{i}.obj") for i in [1, 2, 3, 4]]
