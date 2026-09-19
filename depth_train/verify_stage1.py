@@ -8,13 +8,14 @@ from torch.utils.data import DataLoader
 import torch.nn.functional as F
 from dataset_distill import DualDistillDataset 
 from learning.models.student_depth_net import StudentDepthNet
-# 💥 引入配置中的常量
-from learning.training.training_config import DISTILL_PHYSICAL_WIDTH, DISTILL_PHYSICAL_THICKNESS, DISTILL_K_BASE
+# 💥 引入配置中的常量 (统一使用相对缩放先验)
+from learning.training.training_config import MAX_Z_RATIO
 
 def verify_stage1_all():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    ckpt_path = "/root/lanyun-tmp/models/stage1_distill/models/student_stage1_ep99.pth"
+    # 🌟 加载平滑后的 EMA 权重，释放最强泛化能力！
+    ckpt_path = "/root/lanyun-tmp/models/stage1_distill/models/student_stage1_ema_ep99.pth"
     out_dir = "/root/lanyun-tmp/models/stage1_distill/verify_results_all"
     os.makedirs(out_dir, exist_ok=True)
     
@@ -36,8 +37,7 @@ def verify_stage1_all():
     
     dataset = DualDistillDataset(is_training=False)
     dataloader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0) 
-    
-    MAX_Z_CORRECTION = 0.03
+
     
     print(f"🚀 开始全量数据集测试！图像将保存在 {out_dir}")
     print("=" * 50)
@@ -90,16 +90,22 @@ def verify_stage1_all():
             mask_gt = batch["mask_gt"].to(device).float()
             Z_base = batch["Z_base"].to(device).view(-1, 1, 1, 1).float()
             
+            # 🌟 提取动态宽度
+            dynamic_width = batch["mesh_width"].to(device).view(-1, 1, 1, 1).float()
+
             shape_weight_raw, mask_pred, delta_z_scalar = model(inputs_6c)
-            
-            shape_weight = torch.tanh(shape_weight_raw)
-            delta_z = torch.tanh(delta_z_scalar.view(-1, 1, 1, 1)) * MAX_Z_CORRECTION
-            # 使用导入的真实物理厚度常量
-            D_pred = Z_base + delta_z + shape_weight * DISTILL_PHYSICAL_THICKNESS
+
+            # 🌟 第一处：替换起伏极限
+            shape_weight = torch.tanh(shape_weight_raw) * dynamic_width
+            delta_z_rel = torch.tanh(delta_z_scalar.view(-1, 1, 1, 1)) * MAX_Z_RATIO
+            z_global = Z_base * (1.0 + delta_z_rel)
+
+            D_pred = z_global + shape_weight
 
             # ========== 每帧计算训练等价 loss_feat ==========
             unnorm_rays = batch["unnorm_rays"].to(device).float()
-            XYZ_scale = DISTILL_PHYSICAL_WIDTH
+            # 🌟 第二处：替换物理宽度用于归一化
+            XYZ_scale = dynamic_width
             XYZ_pred_norm = (D_pred * unnorm_rays) / XYZ_scale
             XYZ_gt_norm = (depth_gt * unnorm_rays) / XYZ_scale
             A_pred = torch.cat([rgb_crop, XYZ_pred_norm], dim=1)

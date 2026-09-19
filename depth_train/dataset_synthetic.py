@@ -5,15 +5,12 @@ import numpy as np
 from torch.utils.data import Dataset
 import torchvision.transforms as T
 import random
-
 # 强制使用 OSMesa 离屏渲染，防止 DataLoader 多进程死锁
 os.environ['PYOPENGL_PLATFORM'] = 'osmesa'
 import pyrender
 import trimesh
-
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from learning.training.training_config import DISTILL_K_BASE, DISTILL_PHYSICAL_WIDTH
 
 class SyntheticPretrainDataset(Dataset):
     def __init__(self, data_dir=None, is_training=True):
@@ -30,9 +27,14 @@ class SyntheticPretrainDataset(Dataset):
         if not os.path.exists(self.mesh_dir):
             raise FileNotFoundError(f"找不到模型目录，请检查路径: {self.mesh_dir}")
         
-        self.K_base = np.array(DISTILL_K_BASE, dtype=np.float32)
+        # 🌟 尝试加载内参，若无则默认使用内窥镜广角参数
+        k_path = os.path.join(data_dir, "cam_K.txt")
+        if os.path.exists(k_path):
+            self.K_base = np.loadtxt(k_path, dtype=np.float32)
+        else:
+            self.K_base = np.array([[557.0, 0, 480.0], [0, 557.0, 270.0], [0, 0, 1.0]], dtype=np.float32)
+            
         self.color_jitter = T.ColorJitter(brightness=0.5, hue=0.1)
-
         # 1. 加载背景图
         self.bgs = []
         for bg_file in os.listdir(self.bg_dir):
@@ -52,7 +54,6 @@ class SyntheticPretrainDataset(Dataset):
                 
                 tm.vertices -= tm.bounding_box.centroid
                 max_extent = max(tm.extents)
-                tm.vertices *= (DISTILL_PHYSICAL_WIDTH / max_extent)
                 
                 material = pyrender.MetallicRoughnessMaterial(
                     metallicFactor=0.05, 
@@ -60,6 +61,9 @@ class SyntheticPretrainDataset(Dataset):
                     baseColorFactor=(0.75, 0.70, 0.65, 1.0)
                 )
                 self.meshes.append(pyrender.Mesh.from_trimesh(tm, smooth=True, material=material))
+                # 记录该模型在“米”单位下的真实宽度
+                if not hasattr(self, 'mesh_widths'): self.mesh_widths = []
+                self.mesh_widths.append(max_extent)
                 
         print(f"✅ 成功加载 {len(self.bgs)} 张背景图与 {len(self.meshes)} 个 3D 模型。")
         
@@ -72,14 +76,13 @@ class SyntheticPretrainDataset(Dataset):
 
     def _init_pyrender(self):
         """💥 新增：在子进程中独立创建渲染环境，与主进程彻底物理隔离！"""
-        safe_margin = DISTILL_PHYSICAL_WIDTH
+        safe_margin = max(self.mesh_widths)
         camera = pyrender.IntrinsicsCamera(
             fx=self.K_base[0,0], fy=self.K_base[1,1], 
             cx=self.K_base[0,2], cy=self.K_base[1,2], 
             znear=0.01 * safe_margin, zfar=1000.0 * safe_margin
         )
         light = pyrender.DirectionalLight(color=[1.0, 1.0, 0.95], intensity=1.5)
-
         for mesh in self.meshes:
             scene = pyrender.Scene(bg_color=[0, 0, 0, 0], ambient_light=[0.4, 0.4, 0.4])
             scene.add(mesh, pose=np.eye(4)) # 牙齿定死在原点
@@ -106,17 +109,55 @@ class SyntheticPretrainDataset(Dataset):
         cam_node = self.camera_nodes[idx]
         light_node = self.light_nodes[idx]
 
-        target_pixel_width = random.uniform(150.0, 400.0)
-        z_val = self.K_base[0, 0] * (DISTILL_PHYSICAL_WIDTH / target_pixel_width)
+        # =========================================================
+        # 🌟 1. 内参随机化：fx 采样范围覆盖 wxb 和 远场 [500, 2800]
+        # =========================================================
+        fx_rand = random.uniform(500.0, 2800.0)
+        fy_rand = fx_rand
+        cx, cy = self.K_base[0,2], self.K_base[1,2]
+        K_rand = np.array([[fx_rand, 0, cx], [0, fy_rand, cy], [0, 0, 1.0]], dtype=np.float32)
+        
+        # 动态替换 PyRender 相机节点以应用新内参
+        scene.remove_node(cam_node)
+        safe_margin = max(self.mesh_widths)
+        new_camera = pyrender.IntrinsicsCamera(
+            fx=fx_rand, fy=fy_rand, cx=cx, cy=cy, 
+            znear=0.01 * safe_margin, zfar=1000.0 * safe_margin
+        )
+        cam_node = scene.add(new_camera, pose=np.eye(4))
+        self.camera_nodes[idx] = cam_node # 更新引用
+
+        # =========================================================
+        # 🌟 2. 目标宽度优化：[160, 620] 集中在真实场景尺度
+        # =========================================================
+        target_pixel_width = random.uniform(160.0, 620.0)
+        z_val = K_rand[0, 0] * (self.mesh_widths[idx] / target_pixel_width)
         
         mesh_pose = np.eye(4)
         mesh_pose[2, 3] = -z_val 
         
+        # =========================================================
+        # 🌟 3. 角度收敛：总倾斜角限制，避免双轴同时大角度的极端样本
+        # =========================================================
         base_rot = cv2.Rodrigues(np.array([0.0, 0.0, 0.0]))[0] 
-        rot_x = cv2.Rodrigues(np.array([random.uniform(-0.4, 0.4), 0, 0]))[0]
-        rot_y = cv2.Rodrigues(np.array([0, random.uniform(-0.4, 0.4), 0]))[0]
+        
+        max_tilt = 0.7  # 总最大倾斜角，单位弧度，≈40°
+        while True:
+            rot_x_val = random.uniform(-max_tilt, max_tilt)
+            rot_y_val = random.uniform(-max_tilt, max_tilt)
+            # 计算总倾斜角的余弦，同时复用给后续cos_theta
+            cos_theta = np.cos(rot_x_val) * np.cos(rot_y_val)
+            # 总倾斜角 ≤ max_tilt 就接受，否则重新采样
+            if cos_theta >= np.cos(max_tilt):
+                break
+        
+        rot_x = cv2.Rodrigues(np.array([rot_x_val, 0, 0]))[0]
+        rot_y = cv2.Rodrigues(np.array([0, rot_y_val, 0]))[0]
         rot_z = cv2.Rodrigues(np.array([0, 0, random.uniform(-np.pi, np.pi)]))[0]
         mesh_pose[:3, :3] = rot_z @ rot_y @ rot_x @ base_rot
+        
+        # 安全下限兜底，和原有逻辑兼容
+        cos_theta = max(cos_theta, 0.5)
         
         # 逆矩阵法则移动相机
         cam_pose = np.linalg.inv(mesh_pose)
@@ -128,10 +169,11 @@ class SyntheticPretrainDataset(Dataset):
         scene.set_pose(light_node, pose=light_pose)
         
         color, depth = self.renderer.render(scene)
-        return color, depth
+        # 将随机生成的 K_rand 和角度补偿系数传递出去
+        return color, depth, self.mesh_widths[idx], K_rand, cos_theta
 
     def __getitem__(self, idx):
-        render_rgb, depth_gt = self._render_random_mesh()
+        render_rgb, depth_gt, current_mesh_width, K_rand, cos_theta = self._render_random_mesh()
         mask_gt = (depth_gt > 0).astype(np.float32)
         
         bg_img = random.choice(self.bgs).copy()
@@ -161,26 +203,20 @@ class SyntheticPretrainDataset(Dataset):
             
         c_x_new, c_y_new = c_x + dx, c_y + dy
         crop_size = max(w, h) * scale * 1.2 
-
         M = cv2.getRotationMatrix2D((c_x_new, c_y_new), angle, 160.0 / crop_size)
         M[0, 2] += 80.0 - c_x_new
         M[1, 2] += 80.0 - c_y_new
-
         rgb_crop = cv2.warpAffine(composite_rgb, M, (160, 160), flags=cv2.INTER_LINEAR, borderValue=(0,0,0))
         depth_crop = cv2.warpAffine(depth_gt, M, (160, 160), flags=cv2.INTER_NEAREST, borderValue=0)
         mask_crop = (depth_crop > 0).astype(np.float32)
-
         if self.is_training:
             import PIL.Image as Image
             rgb_pil = Image.fromarray(rgb_crop)
             rgb_crop = np.array(self.color_jitter(rgb_pil))
-
         rgb_crop = rgb_crop.astype(np.float32) / 255.0
-
         M_3x3 = np.vstack([M, [0, 0, 1]])
-        # K_crop = np.linalg.inv(M_3x3) @ self.K_base
-        # 💥 修复：直接相乘！绝对不能用逆矩阵！
-        K_crop = M_3x3 @ self.K_base
+        # 🌟 使用随机生成的 K_rand 计算射线和 Z_base，让网络彻底适应各种焦距
+        K_crop = M_3x3 @ K_rand
         K_inv = np.linalg.inv(K_crop)
         
         u, v = np.meshgrid(np.arange(160), np.arange(160))
@@ -188,20 +224,25 @@ class SyntheticPretrainDataset(Dataset):
         
         unnorm_rays = (K_inv @ uv1.T).T.reshape(160, 160, 3) 
         ray_map = unnorm_rays / np.linalg.norm(unnorm_rays, axis=-1, keepdims=True)
-
-        Z_base = self.K_base[0, 0] * (DISTILL_PHYSICAL_WIDTH / max(w, h))
-
+        # =========================================================
+        # 🌟 形状-尺度解耦：Z_base = GT深度中位数 × 随机噪声(±15%)
+        # 废除公式法的固定系统偏差，迫使网络学习相对形状而非记住固定偏移
+        # =========================================================
+        valid_depth_vals = depth_crop[depth_crop > 0]
+        gt_z_median = np.median(valid_depth_vals) if len(valid_depth_vals) > 0 else 0.1
+        noise_scale = random.uniform(0.85, 1.15)
+        Z_base = float(gt_z_median * noise_scale)
         rgb_t = torch.from_numpy(rgb_crop).permute(2, 0, 1).float()
         ray_t = torch.from_numpy(ray_map).permute(2, 0, 1).float()
         inputs_6c = torch.cat([rgb_t, ray_t], dim=0) 
-
         # 💥 暴君式释放内存：赶在返回给主进程之前，强制销毁局部高清大图废料！
         del render_rgb, depth_gt, bg_img, composite_rgb
-
         return {
             "inputs_6c": inputs_6c, 
             "rgb_crop": rgb_t,
             "depth_gt": torch.from_numpy(depth_crop).unsqueeze(0),
             "mask_gt": torch.from_numpy(mask_crop).unsqueeze(0),
-            "Z_base": torch.tensor(Z_base, dtype=torch.float32)
+            "Z_base": torch.tensor(Z_base, dtype=torch.float32),
+            # 🌟 新增：传出动态宽度，供网络计算动态形状极限
+            "mesh_width": torch.tensor(current_mesh_width, dtype=torch.float32)
         }

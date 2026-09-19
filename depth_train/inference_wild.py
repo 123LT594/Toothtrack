@@ -7,13 +7,13 @@ import numpy as np
 import argparse
 
 from learning.models.student_depth_net import StudentDepthNet
-from learning.training.training_config import DISTILL_PHYSICAL_WIDTH, DISTILL_PHYSICAL_THICKNESS, DISTILL_K_BASE
+from learning.training.training_config import DISTILL_K_BASE, MAX_Z_RATIO
 
 def inference_on_wild_image(img_path, roi_box=None):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # 1. 加载模型
-    ckpt_path = "/root/lanyun-tmp/models/stage1_distill/models/student_stage1_ep99.pth"
+    # 🌟 使用泛化性更强的 EMA 权重应对野生图片
+    ckpt_path = "/root/lanyun-tmp/models/stage1_distill/models/student_stage1_ema_ep99.pth"
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(f"找不到权重文件: {ckpt_path}")
 
@@ -80,8 +80,10 @@ def inference_on_wild_image(img_path, roi_box=None):
     ray_map = unnorm_rays / np.linalg.norm(unnorm_rays, axis=-1, keepdims=True)
     ray_tensor = torch.from_numpy(ray_map).float().permute(2,0,1)
     
+    default_physical_width = 0.015 
+
     inputs_6c = torch.cat([rgb_tensor, ray_tensor], dim=0).unsqueeze(0).to(device)
-    Z_base = K_base[0, 0] * (DISTILL_PHYSICAL_WIDTH / crop_size)
+    Z_base = K_base[0, 0] * (default_physical_width / crop_size)
     
     # ========================================================
     # 模型推理！
@@ -89,10 +91,11 @@ def inference_on_wild_image(img_path, roi_box=None):
     with torch.no_grad():
         shape_weight_raw, mask_pred, delta_z_scalar = model(inputs_6c)
         
-        MAX_Z_CORRECTION = 0.03
-        shape_weight = torch.tanh(shape_weight_raw)
-        delta_z = torch.tanh(delta_z_scalar.view(-1, 1, 1, 1)) * MAX_Z_CORRECTION
-        D_pred = Z_base + delta_z + shape_weight * DISTILL_PHYSICAL_THICKNESS
+        # 🌟 使用虚拟物理尺寸约束起伏
+        shape_weight = torch.tanh(shape_weight_raw) * default_physical_width
+        delta_z_rel = torch.tanh(delta_z_scalar.view(-1, 1, 1, 1)) * MAX_Z_RATIO
+        z_global = Z_base * (1.0 + delta_z_rel)
+        D_pred = z_global + shape_weight
         
         mask_crop_np = (mask_pred[0, 0].cpu().numpy() * 255).astype(np.uint8)
         depth_crop_np = D_pred[0, 0].cpu().numpy()

@@ -1,19 +1,29 @@
 import os
 import numpy as np
 import cv2
+import re
 from tqdm import tqdm
 
 # ================= 配置区 =================
 # 深度图所在路径
-DEPTH_DIR = "./golden_dataset/depth"
+DEPTH_DIR = "./demo_data/wxb/depth"
 # 可视化输出路径
-OUT_DIR = "./inference_results/vis_depth_check"
+OUT_DIR = "./demo_data/wxb/vis_depth_check"
 
 os.makedirs(OUT_DIR, exist_ok=True)
 # ==========================================
 
+def natural_sort_key(s):
+    """实现自然排序，确保 2.npy 在 10.npy 前面"""
+    return [int(text) if text.isdigit() else text.lower() for text in re.split(r'(\d+)', s)]
+
 def main():
+    # 读取文件列表
     npy_files = [f for f in os.listdir(DEPTH_DIR) if f.endswith('.npy')]
+    
+    # 🌟 核心修改：对文件列表进行自然排序
+    npy_files = sorted(npy_files, key=natural_sort_key)
+    
     print(f"🔍 正在转换 {len(npy_files)} 张深度图进行灰度可视化 (近亮远暗)...")
 
     for f in tqdm(npy_files):

@@ -8,9 +8,9 @@ import pickle
 from tqdm import tqdm
 
 # ================= 配置区 =================
-OBJ_PATH = "/root/Toothtrack/demo_data/ztooth/mesh/tooth.obj"          
-CAM_K_PATH = "/root/Toothtrack/demo_data/ztooth/cam_K.txt"   
-OUTPUT_PKL = "/root/Toothtrack/demo_data/ztooth/zero_shot_db.pkl" 
+OBJ_PATH = "/root/Toothtrack/demo_data/wxb/mesh/tooth.obj"          
+CAM_K_PATH = "/root/Toothtrack/demo_data/wxb/cam_K.txt"   
+OUTPUT_PKL = "/root/Toothtrack/demo_data/wxb/zero_shot_db.pkl" 
 DEBUG_DIR = "/root/lanyun-tmp/prerender"      
 
 TARGET_SIZE = 160       
