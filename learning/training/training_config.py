@@ -6,8 +6,9 @@ import omegaconf
 import torch
 
 #========新增=========
-# 形状-尺度解耦方案：delta_z 仅做小范围微调（±7%），全局尺度由推理侧 ICP + 3D 物理模型锚定
-MAX_Z_RATIO = 0.07
+# 形状-尺度解耦方案：delta_z 做全局尺度修正（±15%），与Z_base噪声范围匹配
+# 全局尺度最终由推理侧 ICP + 3D 物理模型锚定，delta_z负责训练时修正Z_base偏差
+MAX_Z_RATIO = 0.15
 SHAPE_SCALE_RATIO = 0.5  #覆盖**最大训练倾角下，牙齿沿光轴的全部深度差**
 # 真理内参 (仅为 inference_wild.py 等无相机参数的野生推理提供缺省物理锚点)
 DISTILL_K_BASE = [

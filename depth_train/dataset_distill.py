@@ -9,7 +9,7 @@ import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 class DualDistillDataset(Dataset):
-    def __init__(self, data_dir=None, is_training=True):
+    def __init__(self, data_dir=None, is_training=True, dataset_id=0):
         super().__init__()
         if data_dir is None:
             _current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -19,7 +19,8 @@ class DualDistillDataset(Dataset):
         self.pose_dir = os.path.join(data_dir, "pose")
         self.frames = [f.split('.')[0] for f in os.listdir(self.pose_dir) if f.endswith('.npy')]
         self.is_training = is_training
-        self.data_dir = data_dir  
+        self.data_dir = data_dir
+        self.dataset_id = dataset_id  # 0=旧数据集(2800长焦), 1=新数据集(500短焦)
         
         k_path = os.path.join(self.data_dir, "cam_K.txt")
         if not os.path.exists(k_path):
@@ -146,13 +147,16 @@ class DualDistillDataset(Dataset):
         Z_base_np = np.array(Z_base, dtype=np.float32)
         rgb_t = torch.from_numpy(rgb_crop).permute(2, 0, 1)
         ray_t = torch.from_numpy(ray_map).permute(2, 0, 1)
-        inputs_6c = torch.cat([rgb_t, ray_t], dim=0) 
+        # 🌟 Z_base作为第7通道输入：归一化到0~1（除以0.2m），让网络能"看到"基准深度
+        z_base_norm = torch.full((1, rgb_t.shape[1], rgb_t.shape[2]), Z_base / 0.2, dtype=torch.float32)
+        inputs_6c = torch.cat([rgb_t, ray_t, z_base_norm], dim=0)  # 实际7通道：RGB(3)+Ray(3)+Z_base(1)
         return {
             "inputs_6c": inputs_6c,
             "rgb_crop": rgb_t,
             "depth_gt": torch.from_numpy(depth_crop).unsqueeze(0),
             "unnorm_rays": torch.from_numpy(unnorm_rays).permute(2, 0, 1).float(),
             "mask_gt": torch.from_numpy(mask_crop).unsqueeze(0),
-            "Z_base": torch.tensor(Z_base_np, dtype=torch.float32),
-            "mesh_width": torch.tensor(self.dynamic_physical_width, dtype=torch.float32)
+            "Z_base": torch.tensor(Z_base, dtype=torch.float32),
+            "mesh_width": torch.tensor(self.dynamic_physical_width, dtype=torch.float32),
+            "dataset_id": torch.tensor(self.dataset_id, dtype=torch.long)
         }

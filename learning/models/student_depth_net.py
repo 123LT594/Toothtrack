@@ -8,16 +8,20 @@ class StudentDepthNet(nn.Module):
         # 加载 ConvNeXt-Tiny
         self.backbone = convnext_tiny(weights=ConvNeXt_Tiny_Weights.DEFAULT)
         
-        # 修改第一层卷积以接受 6 通道输入 (RGB + RayMap)
+        # 修改第一层卷积以接受 7 通道输入 (RGB + RayMap + Z_base)
         original_conv = self.backbone.features[0][0]
-        self.backbone.features[0][0] = nn.Conv2d(
-            6, original_conv.out_channels, 
+        new_conv = nn.Conv2d(
+            7, original_conv.out_channels, 
             kernel_size=original_conv.kernel_size, 
             stride=original_conv.stride, 
             padding=original_conv.padding
         )
-        # 初始化新增通道的权重
-        nn.init.kaiming_normal_(self.backbone.features[0][0].weight[:, 3:, :, :])
+        # 复制前3通道（RGB）的预训练权重，加速收敛
+        with torch.no_grad():
+            new_conv.weight[:, :3, :, :] = original_conv.weight[:, :3, :, :]
+        # 初始化新增的4个通道（RayMap 3通道 + Z_base 1通道）
+        nn.init.kaiming_normal_(new_conv.weight[:, 3:, :, :])
+        self.backbone.features[0][0] = new_conv
         
         # 深度解码头 (输出原始形状系数，不做 tanh，由训练脚本处理)
         self.depth_head = nn.Sequential(

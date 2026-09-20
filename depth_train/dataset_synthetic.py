@@ -234,7 +234,10 @@ class SyntheticPretrainDataset(Dataset):
         Z_base = float(gt_z_median * noise_scale)
         rgb_t = torch.from_numpy(rgb_crop).permute(2, 0, 1).float()
         ray_t = torch.from_numpy(ray_map).permute(2, 0, 1).float()
-        inputs_6c = torch.cat([rgb_t, ray_t], dim=0) 
+        # 🌟 Z_base作为第7通道输入：归一化到0~1（除以0.2m），让网络能"看到"基准深度
+        # 这是delta_z能学习的前提：网络必须知道Z_base是多少，才能判断偏差
+        z_base_norm = torch.full((1, 160, 160), Z_base / 0.2, dtype=torch.float32)
+        inputs_6c = torch.cat([rgb_t, ray_t, z_base_norm], dim=0)  # 实际7通道：RGB(3)+Ray(3)+Z_base(1)
         # 💥 暴君式释放内存：赶在返回给主进程之前，强制销毁局部高清大图废料！
         del render_rgb, depth_gt, bg_img, composite_rgb
         return {

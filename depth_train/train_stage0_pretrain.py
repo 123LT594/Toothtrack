@@ -14,9 +14,10 @@ from learning.models.student_depth_net import StudentDepthNet
 from learning.training.training_config import MAX_Z_RATIO, SHAPE_SCALE_RATIO
 
 # ---------- 超参数 ----------
-DEEPTH_LOSS_WEIGHT = 30.0      # 深度（相对形状）损失加权系数
-LOSS_Z_WEIGHT = 0.5          # delta_z 小范围微调监督权重（解耦后大幅降低）
-SHAPE_REG_WEIGHT = 0.3        # shape均值正则：强制shape只表达局部起伏，不携带全局偏移
+DEEPTH_LOSS_WEIGHT = 10.0      # 深度（相对形状）损失加权系数（从30降到10：避免delta_z梯度被淹没，保持约15:1的平衡比例）
+LOSS_Z_WEIGHT = 5.0          # delta_z 全局尺度修正监督权重（L1损失，平衡点：既有足够梯度又不干扰shape/mask学习）
+SHAPE_REG_WEIGHT = 2.0        # shape均值正则：强制shape只表达局部起伏，不携带全局偏移（硬约束后恒为0，保留作为保险）
+SHAPE_SMOOTH_WEIGHT = 0.1     # shape平滑性损失（Total Variation）：惩罚相邻像素剧烈变化，提升表面光滑度
 # ----------------------------
 
 def compute_l1_ssim(pred, target, mask, window_size=11):
@@ -60,9 +61,13 @@ def compute_bce_dice(pred, target):
 
 def compute_affine_invariant_loss(pred, target, mask, window_size=11):
     """
-    🌟 形状-尺度解耦核心：仿射不变深度损失
-    只监督相对形状（近远比例、表面起伏），不监督全局尺度和偏移。
-    先将预测和GT都归一化到「零均值、单位方差」，再计算L1+SSIM。
+    ⚠️ [已弃用] 仿射不变深度损失 —— 阶段0不使用，原因如下：
+    完全仿射不变（减均值除标准差）对全局缩放和平移完全无惩罚，
+    在阶段0没有特征蒸馏等其他全局约束的情况下，网络会走捷径：
+    把全局偏移藏到shape_weight里（shape_mean不趋近0），导致
+    Loss/Depth下降但绝对深度MAE上升，验证效果差。
+    阶段1有FoundationPose特征蒸馏做隐含全局约束，可尝试使用。
+    保留此函数用于消融实验对比。
     """
     valid_mask = mask > 0.5
     pred_valid = pred[valid_mask]
@@ -115,6 +120,21 @@ def compute_shape_mean_reg(shape_weight, mask):
     shape_mean = shape_masked.sum(dim=[1,2,3]) / (mask.sum(dim=[1,2,3]) + 1e-8)
     return torch.mean(shape_mean ** 2)
 
+def compute_shape_smooth_loss(shape_weight, mask):
+    """
+    🌟 shape平滑性损失（Total Variation）：惩罚相邻像素的剧烈变化
+    提升牙齿表面的光滑度，减少噪声状的形状输出
+    """
+    # 水平方向梯度
+    diff_h = torch.abs(shape_weight[:, :, :, 1:] - shape_weight[:, :, :, :-1])
+    mask_h = mask[:, :, :, 1:] * mask[:, :, :, :-1]
+    # 垂直方向梯度
+    diff_v = torch.abs(shape_weight[:, :, 1:, :] - shape_weight[:, :, :-1, :])
+    mask_v = mask[:, :, 1:, :] * mask[:, :, :-1, :]
+    smooth_h = (diff_h * mask_h).sum() / (mask_h.sum() + 1e-8)
+    smooth_v = (diff_v * mask_v).sum() / (mask_v.sum() + 1e-8)
+    return smooth_h + smooth_v
+
 def train_stage0():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
@@ -133,11 +153,14 @@ def train_stage0():
     
     student = StudentDepthNet().to(device)
     optimizer = torch.optim.AdamW(student.parameters(), lr=2e-4, weight_decay=1e-4)
+    # 🌟 余弦退火学习率调度：从2e-4平滑降到1e-6，减少后期震荡
+    # 输入通道改为7通道（加入Z_base），需从头训练，T_max=50对应总训练轮数
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=50, eta_min=1e-6)
     
     writer = SummaryWriter(log_dir=log_dir)
     print(f"📁 所有数据保存至: {base_out_dir}")
     
-    # 自动断点续训
+    # 自动断点续训（兼容旧格式：只存模型权重；新格式：存完整checkpoint）
     start_epoch = 0
     if os.path.exists(model_dir):
         checkpoints = [f for f in os.listdir(model_dir) if f.startswith("student_stage0_ep") and f.endswith(".pth")]
@@ -146,8 +169,20 @@ def train_stage0():
             latest_epoch = max(epochs)
             latest_ckpt = os.path.join(model_dir, f"student_stage0_ep{latest_epoch}.pth")
             print(f"🔄 加载权重: {latest_ckpt}")
-            student.load_state_dict(torch.load(latest_ckpt, map_location=device))
-            start_epoch = latest_epoch + 1
+            ckpt = torch.load(latest_ckpt, map_location=device)
+            if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
+                # 🌟 新格式：完整checkpoint，同时加载模型、优化器、调度器
+                student.load_state_dict(ckpt['model_state_dict'])
+                optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+                if 'scheduler_state_dict' in ckpt:
+                    scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+                start_epoch = ckpt.get('epoch', latest_epoch) + 1
+                print(f"✅ 加载完整checkpoint（含优化器+调度器状态）")
+            else:
+                # 旧格式：只有模型权重，优化器保持初始化状态
+                student.load_state_dict(ckpt)
+                start_epoch = latest_epoch + 1
+                print(f"⚠️ 旧格式checkpoint（仅模型权重），优化器重新初始化")
             print(f"🚀 从 Epoch {start_epoch} 继续训练")
     
     for epoch in range(start_epoch, 50):
@@ -158,11 +193,14 @@ def train_stage0():
         epoch_loss_shape_reg = 0.0
         # 🌟 新增：核心指标epoch累加器
         epoch_delta_z = 0.0
+        epoch_delta_z_gt = 0.0       # 🌟 真实delta_z（用于验证网络是否学会）
+        epoch_delta_z_error = 0.0    # 🌟 |pred - gt|，最关键的验证指标
         epoch_shape_std = 0.0
         epoch_shape_max = 0.0
         epoch_shape_mean = 0.0
         epoch_mae = 0.0
         epoch_iou = 0.0
+        epoch_loss_shape_smooth = 0.0  # 🌟 shape平滑损失
         
         pbar = tqdm(enumerate(dataloader), total=len(dataloader), desc=f"Epoch [{epoch}/50]")
         for batch_idx, batch in pbar:
@@ -180,11 +218,16 @@ def train_stage0():
             
             shape_weight = torch.tanh(shape_weight_raw) * dynamic_width * SHAPE_SCALE_RATIO
             
-            # 🌟 全局偏移：动态计算相对推拉比例 (如 ±15%)
+            # 🌟 硬约束：强制减掉shape在mask内的均值，shape只表达局部起伏，不能携带全局偏移
+            # 这比软正则（shape_mean_reg）更直接、更有效，彻底杜绝网络走捷径
+            shape_mean_val = (shape_weight * mask_gt).sum(dim=[1,2,3], keepdim=True) / (mask_gt.sum(dim=[1,2,3], keepdim=True) + 1e-8)
+            shape_weight = shape_weight - shape_mean_val  # 广播减法，mask内均值恒为0
+            
+            # 🌟 全局偏移：动态计算相对推拉比例 (如 ±7%)
             delta_z_rel = torch.tanh(delta_z_scalar.view(-1, 1, 1, 1)) * MAX_Z_RATIO
             z_global = Z_base * (1.0 + delta_z_rel)
             
-            # 最终深度图：完美解耦
+            # 最终深度图：全局尺度由Z_base+delta_z决定，局部形状由shape决定（shape均值恒为0）
             D_pred = z_global + shape_weight
 
             # ================= 🕵️ 硬核验证：只在第0个Batch打印一次 =================
@@ -199,21 +242,38 @@ def train_stage0():
             
             # 损失计算
             loss_mask = compute_bce_dice(mask_pred, mask_gt)
-            # 🌟 形状-尺度解耦：使用仿射不变损失，只监督相对形状
-            loss_depth = compute_affine_invariant_loss(D_pred, depth_gt, mask_gt)
+            # 🌟 相对L1+SSIM：对全局缩放有弱惩罚，防止网络把全局偏移藏到shape里
+            loss_depth = compute_l1_ssim(D_pred, depth_gt, mask_gt)
 
             # =========================================================
             # 🌟 核心修复：新增阶段 0 的 delta_z 显式监督
             # 强制全局偏移头承担基准微调职责，杜绝 shape_weight "篡位"做全局平移
+            # 用GT中位数计算delta_z_gt，和Z_base的定义（基于中位数）一致
             # =========================================================
-            depth_gt_mean = (depth_gt * mask_gt).sum(dim=[1,2,3]) / (mask_gt.sum(dim=[1,2,3]) + 1e-8)
-            delta_z_gt = (depth_gt_mean.view(-1, 1, 1, 1) - Z_base) / Z_base
-            loss_z = F.mse_loss(delta_z_rel, delta_z_gt)
+            batch_size = depth_gt.shape[0]
+            depth_gt_median = torch.zeros(batch_size, 1, 1, 1, device=device)
+            for b in range(batch_size):
+                valid = depth_gt[b, 0][mask_gt[b, 0] > 0.5]
+                if valid.numel() > 0:
+                    depth_gt_median[b, 0, 0, 0] = torch.median(valid)
+            delta_z_gt = (depth_gt_median - Z_base) / Z_base
+            # 用L1而非MSE：梯度更稳定，对大偏差样本修正更有效
+            loss_z = F.l1_loss(delta_z_rel, delta_z_gt)
+            
+            # 🌟 累加delta_z验证指标（用于TensorBoard曲线判断是否学会）
+            with torch.no_grad():
+                epoch_delta_z += delta_z_rel[0].item() * 100  # 转百分比
+                epoch_delta_z_gt += delta_z_gt[0].item() * 100
+                epoch_delta_z_error += abs(delta_z_rel[0].item() - delta_z_gt[0].item()) * 100
 
             # 🌟 新增：shape均值正则，强制shape只表达局部起伏
             loss_shape_reg = compute_shape_mean_reg(shape_weight, mask_gt)
+            
+            # 🌟 新增：shape平滑性损失，提升表面光滑度
+            loss_shape_smooth = compute_shape_smooth_loss(shape_weight, mask_gt)
 
-            loss_total = loss_mask + DEEPTH_LOSS_WEIGHT * loss_depth + LOSS_Z_WEIGHT * loss_z + SHAPE_REG_WEIGHT * loss_shape_reg
+            loss_total = (loss_mask + DEEPTH_LOSS_WEIGHT * loss_depth + LOSS_Z_WEIGHT * loss_z 
+                          + SHAPE_REG_WEIGHT * loss_shape_reg + SHAPE_SMOOTH_WEIGHT * loss_shape_smooth)
             
             optimizer.zero_grad()
             loss_total.backward()
@@ -223,45 +283,55 @@ def train_stage0():
             epoch_loss_depth += loss_depth.item()
             epoch_loss_mask += loss_mask.item()
             epoch_loss_shape_reg += loss_shape_reg.item()
+            epoch_loss_shape_smooth += loss_shape_smooth.item()
             
-            # 计算核心监控指标
+            # 计算核心监控指标（🌟 改为整个batch平均，不再只取第0个样本，曲线更可信）
             with torch.no_grad():
-                valid_mask = mask_gt[0, 0] > 0.5
-                if valid_mask.sum() > 0:
-                    std_depth = D_pred[0, 0][valid_mask].std().item()
-                    min_depth = D_pred[0, 0][valid_mask].min().item()
-                    max_depth = D_pred[0, 0][valid_mask].max().item()
-                    delta_z_val = delta_z_rel[0].item() * 100
-                    
-                    # 🌟 新增：形状与精度指标计算
-                    shape_vals = shape_weight[0, 0][valid_mask]
-                    shape_std = shape_vals.std().item() * 1000  # 转毫米
-                    shape_max_abs = shape_vals.abs().max().item() * 1000  # 转毫米
-                    shape_mean_val = shape_vals.mean().item() * 1000  # 转毫米，理想值趋近0
-                    mae = torch.abs(D_pred[0,0] - depth_gt[0,0])[valid_mask].mean().item() * 1000  # 转毫米
-                    
-                    # 掩码IoU
-                    pred_mask_bin = mask_pred[0,0] > 0.5
-                    intersection = torch.logical_and(pred_mask_bin, valid_mask).sum().item()
-                    union = torch.logical_or(pred_mask_bin, valid_mask).sum().item()
-                    iou = intersection / (union + 1e-8)
-                else:
-                    std_depth = 0.0
-                    min_depth = max_depth = 0.0
-                    delta_z_val = 0.0
-                    shape_std = 0.0
-                    shape_max_abs = 0.0
-                    shape_mean_val = 0.0
-                    mae = 0.0
-                    iou = 0.0
+                # delta_z：整个batch平均
+                batch_delta_z = delta_z_rel.mean().item() * 100
+                batch_delta_z_gt = delta_z_gt.mean().item() * 100
+                batch_delta_z_error = (delta_z_rel - delta_z_gt).abs().mean().item() * 100
+                
+                # 形状与精度指标：整个batch平均（遍历每个样本）
+                batch_shape_std = 0.0
+                batch_shape_max = 0.0
+                batch_shape_mean = 0.0
+                batch_mae = 0.0
+                batch_iou = 0.0
+                valid_count = 0
+                for b in range(batch_size):
+                    valid_mask_b = mask_gt[b, 0] > 0.5
+                    if valid_mask_b.sum() > 0:
+                        shape_vals_b = shape_weight[b, 0][valid_mask_b]
+                        batch_shape_std += shape_vals_b.std().item() * 1000
+                        batch_shape_max += shape_vals_b.abs().max().item() * 1000
+                        batch_shape_mean += shape_vals_b.mean().item() * 1000
+                        batch_mae += torch.abs(D_pred[b,0] - depth_gt[b,0])[valid_mask_b].mean().item() * 1000
+                        pred_mask_bin_b = mask_pred[b,0] > 0.5
+                        intersection = torch.logical_and(pred_mask_bin_b, valid_mask_b).sum().item()
+                        union = torch.logical_or(pred_mask_bin_b, valid_mask_b).sum().item()
+                        batch_iou += intersection / (union + 1e-8)
+                        valid_count += 1
+                if valid_count > 0:
+                    batch_shape_std /= valid_count
+                    batch_shape_max /= valid_count
+                    batch_shape_mean /= valid_count
+                    batch_mae /= valid_count
+                    batch_iou /= valid_count
                 
                 # 累加到epoch级
-                epoch_delta_z += delta_z_val
-                epoch_shape_std += shape_std
-                epoch_shape_max += shape_max_abs
-                epoch_shape_mean += shape_mean_val
-                epoch_mae += mae
-                epoch_iou += iou
+                epoch_delta_z += batch_delta_z
+                epoch_delta_z_gt += batch_delta_z_gt
+                epoch_delta_z_error += batch_delta_z_error
+                epoch_shape_std += batch_shape_std
+                epoch_shape_max += batch_shape_max
+                epoch_shape_mean += batch_shape_mean
+                epoch_mae += batch_mae
+                epoch_iou += batch_iou
+                
+                # 进度条显示用第0个样本（保持简洁）
+                delta_z_val = delta_z_rel[0].item() * 100
+                std_depth = D_pred[0, 0][mask_gt[0, 0] > 0.5].std().item() if (mask_gt[0, 0] > 0.5).sum() > 0 else 0.0
             
             # 进程内存
             process = psutil.Process(os.getpid())
@@ -330,9 +400,12 @@ def train_stage0():
         writer.add_scalar("Loss/Depth", epoch_loss_depth / num_batches, epoch)
         writer.add_scalar("Loss/Mask", epoch_loss_mask / num_batches, epoch)
         writer.add_scalar("Loss/ShapeReg", epoch_loss_shape_reg / num_batches, epoch)
+        writer.add_scalar("Loss/ShapeSmooth", epoch_loss_shape_smooth / num_batches, epoch)
 
         # 🌟 新增：核心业务指标曲线
         writer.add_scalar("Metrics/delta_z_rel(%)", epoch_delta_z / num_batches, epoch)
+        writer.add_scalar("Metrics/delta_z_gt(%)", epoch_delta_z_gt / num_batches, epoch)
+        writer.add_scalar("Metrics/delta_z_error(%)", epoch_delta_z_error / num_batches, epoch)  # 🌟 最关键：持续下降说明学会了
         writer.add_scalar("Metrics/shape_std(mm)", epoch_shape_std / num_batches, epoch)
         writer.add_scalar("Metrics/shape_max_abs(mm)", epoch_shape_max / num_batches, epoch)
         writer.add_scalar("Metrics/shape_mean(mm)", epoch_shape_mean / num_batches, epoch)
@@ -341,8 +414,17 @@ def train_stage0():
         
         if (epoch + 1) % 5 == 0 or epoch == 49:
             save_path = os.path.join(model_dir, f"student_stage0_ep{epoch}.pth")
-            torch.save(student.state_dict(), save_path)
-            print(f"💾 保存权重: {save_path}")
+            # 🌟 保存完整checkpoint：模型+优化器+调度器+epoch，支持完美断点续训
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': student.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+            }, save_path)
+            print(f"💾 保存完整checkpoint: {save_path}")
+        
+        # 🌟 每个epoch结束后更新学习率
+        scheduler.step()
     
     writer.close()
 

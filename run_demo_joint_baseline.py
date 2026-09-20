@@ -16,27 +16,49 @@ from utils.estimater import *
 from utils.datareader import *
 from utils.tools import *
 from utils.render_3d import create_visualization
-from utils.depth_model_joint import SwinMultiTaskUNet
 
-# =====================================================================
-# 🌟 新增：顶会级 3D 几何评估计算器 (TE, RE, ADD)
-# =====================================================================
+from learning.models.student_depth_net import StudentDepthNet
+from learning.training.training_config import MAX_Z_RATIO, SHAPE_SCALE_RATIO
+from utils.zero_shot_geometry_matcher import FastZeroShotMatcher
+
 def calc_te(pose_pred, pose_gt):
-    """计算平移误差 (Translation Error)，返回毫米 (mm)"""
     return np.linalg.norm(pose_pred[:3, 3] - pose_gt[:3, 3]) * 1000.0
 
 def calc_re(pose_pred, pose_gt):
-    """计算旋转误差 (Rotation Error)，返回度数 (°)"""
     R_pred, R_gt = pose_pred[:3, :3], pose_gt[:3, :3]
     trace = np.trace(R_pred @ R_gt.T)
-    # clip 防越界产生 nan
     return np.rad2deg(np.arccos(np.clip((trace - 1.0) / 2.0, -1.0, 1.0)))
 
 def calc_add(pose_pred, pose_gt, vertices):
-    """计算表面模型平均距离 (ADD)，返回毫米 (mm)"""
     pts_pred = (pose_pred[:3, :3] @ vertices.T + pose_pred[:3, 3:4]).T
     pts_gt = (pose_gt[:3, :3] @ vertices.T + pose_gt[:3, 3:4]).T
     return np.linalg.norm(pts_pred - pts_gt, axis=1).mean() * 1000.0
+
+def get_bbox_from_pose(pose, K, vertices):
+    rvec, _ = cv2.Rodrigues(pose[:3, :3])
+    tvec = pose[:3, 3]
+    pts_2d, _ = cv2.projectPoints(vertices, rvec, tvec, K, None)
+    pts_2d = pts_2d.squeeze()
+    x_min, x_max = pts_2d[:, 0].min(), pts_2d[:, 0].max()
+    y_min, y_max = pts_2d[:, 1].min(), pts_2d[:, 1].max()
+    w = max(x_max - x_min, 10)
+    h = max(y_max - y_min, 10)
+    return x_min, y_min, w, h
+
+def get_auto_color(d_np, mask_uint8):
+    m_np = mask_uint8 > 127
+    vis = np.zeros_like(d_np, dtype=np.uint8)
+    if m_np.sum() > 0:
+        valid = d_np[m_np]
+        p_min, p_max = valid.min(), valid.max()
+        if p_max - p_min > 1e-4:
+            norm = np.clip((d_np - p_min) / (p_max - p_min), 0, 1)
+            vis = (norm * 255).astype(np.uint8)
+        else:
+            vis[m_np] = 127 
+    color = cv2.applyColorMap(vis, cv2.COLORMAP_JET)
+    color[~m_np] = 0
+    return color
 
 class SuppressPrint:
     def __enter__(self):
@@ -51,17 +73,25 @@ if __name__ == "__main__":
     code_dir = os.path.dirname(os.path.realpath(__file__))
     parser.add_argument("--mesh_file", type=str, default=f"{code_dir}/demo_data/tooth/mesh/tooth.obj")
     parser.add_argument("--test_scene_dir", type=str, default=f"{code_dir}/demo_data/tooth")
+    parser.add_argument('--est_refine_iter', type=int, default=5)
     parser.add_argument("--track_refine_iter", type=int, default=1) 
+    parser.add_argument("--weight_student", type=str, default="/root/lanyun-tmp/models/stage1_distill/models/student_stage1_ema_ep99.pth")
     
-    parser.add_argument("--weight_physical", type=str, default="/root/lanyun-tmp/models/models_joint_physical/joint_best.pth")
+    parser.add_argument("--use_pred_init", default=False, type=bool, help="默认开启首帧预测")
+    parser.add_argument("--no_eval", default=False, type=bool, help="默认不开启验证")
+    parser.add_argument("--use_gt_depth", default=False, type=bool, help="用GT深度代替预测深度，验证FoundationPose本身能不能跟住")
+    parser.add_argument("--use_gtpose_every_frame", default=False, type=bool, help="每帧都用gtpose初始化然后refine，验证FoundationPose的refine能力")
+    
     args = parser.parse_args()
 
     output_root = "/root/lanyun-tmp/output"
     beijing_tz = pytz.timezone('Asia/Shanghai')
-    output_dir = os.path.join(output_root, f"{dt.now(beijing_tz).strftime('%m%d_%H%M')}_baseline_track")
+    output_dir = os.path.join(output_root, f"{dt.now(beijing_tz).strftime('%m%d_%H%M')}_distill_track")
     img_output_dir = os.path.join(output_dir, "img")
+    mask_depth_output_dir = os.path.join(output_dir, "mask+depth") 
     os.makedirs(img_output_dir, exist_ok=True)
-    # 🌟 新增：初始化帧误差归档文本
+    os.makedirs(mask_depth_output_dir, exist_ok=True)
+    
     error_txt_path = os.path.join(output_dir, "frame_errors.txt")
     txt_file = open(error_txt_path, "w", encoding="utf-8")
 
@@ -69,220 +99,361 @@ if __name__ == "__main__":
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     glctx = dr.RasterizeCudaContext()
 
-    print("🚀 加载纯物理版大一统前端专家 (SwinMultiTaskUNet)...")
-    model_expert = SwinMultiTaskUNet().to(device)
-    model_expert.load_state_dict(torch.load(args.weight_physical, map_location=device))
+    print("🚀 加载 3D 蒸馏基座 (StudentDepthNet)...")
+    model_expert = StudentDepthNet().to(device)
+    model_expert.load_state_dict(torch.load(args.weight_student, map_location=device))
     model_expert.eval()
 
-    # ImageNet 归一化常量 (与 albumentations 严格一致)
-    mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
-    std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
-
-    ann_path = os.path.join(args.test_scene_dir, "annotations.json")
-    with open(ann_path, 'r') as f: gt_data = json.load(f).get("annotations", {})
+    gt_data = {}
+    ball_centroids = None
     all_frame_errors = []
-    all_frame_times = []
-    # 🌟 新增：初始化 GT 路径和多维评测容器
-    gt_pose_dir = "/root/lanyun-tmp/golden_dataset/pose"
-    gt_depth_dir = "/root/lanyun-tmp/golden_dataset/depth"
-    # 这里存储我们算出的所有高级指标
+    all_track_times = []
     eval_metrics = {'TE': [], 'RE': [], 'ADD': [], 'IoU': [], 'MAE': []}
+    
+    if not args.no_eval:
+        ann_path = os.path.join(args.test_scene_dir, "annotations.json")
+        if os.path.exists(ann_path):
+            with open(ann_path, 'r') as f: gt_data = json.load(f).get("annotations", {})
+        
+        gt_pose_dir = "/root/lanyun-tmp/golden_dataset/pose"
+        gt_depth_dir = "/root/lanyun-tmp/golden_dataset/depth"
 
+        ball_centroids_list = [] 
+        for j in [1, 2, 3, 4]:
+            p = os.path.join(os.path.dirname(args.mesh_file), f"{j}.obj")
+            if os.path.exists(p): ball_centroids_list.append(trimesh.load(p).vertices.mean(0))
+        if ball_centroids_list: ball_centroids = np.array(ball_centroids_list, dtype=np.float32)
+
+    all_frame_times = []
     mesh = trimesh.load(args.mesh_file)
-    model_center = compute_mesh_center(mesh) 
     to_origin, extents = trimesh.bounds.oriented_bounds(mesh)
     bbox = np.stack([-extents / 2, extents / 2], axis=0).reshape(2, 3)
 
-    ball_centroids = [] 
-    for j in [1, 2, 3, 4]:
-        p = os.path.join(os.path.dirname(args.mesh_file), f"{j}.obj")
-        if os.path.exists(p): ball_centroids.append(trimesh.load(p).vertices.mean(0))
-    ball_centroids = np.array(ball_centroids, dtype=np.float32) if ball_centroids else None
-
-    scorer = ScorePredictor()
     refiner = PoseRefinePredictor() 
-    est = FoundationPose(model_pts=mesh.vertices, model_normals=mesh.vertex_normals, mesh=mesh, scorer=scorer, refiner=refiner, glctx=glctx)
-    reader = YcbineoatReader(video_dir=args.test_scene_dir, zfar=np.inf)
+    est = FoundationPose(model_pts=mesh.vertices, model_normals=mesh.vertex_normals, mesh=mesh, scorer=None, refiner=refiner, glctx=glctx)
+    
+    print("🚀 加载 3D 零样本纯几何粗筛器 (FastZeroShotMatcher)...")
+    matcher_pkl_path = "/root/Toothtrack/demo_data/ztooth/zero_shot_db.pkl"
+    matcher = FastZeroShotMatcher(pkl_path=matcher_pkl_path, alpha=0.5)
 
-    video_writer = cv2.VideoWriter(os.path.join(output_dir, "track_baseline.mp4"), cv2.VideoWriter_fourcc(*'mp4v'), 30, (reader.W, reader.H))
+    reader = YcbineoatReader(video_dir=args.test_scene_dir, zfar=np.inf)
+    video_writer = cv2.VideoWriter(os.path.join(output_dir, "track_distill.mp4"), cv2.VideoWriter_fourcc(*'mp4v'), 30, (reader.W, reader.H))
+    previous_pose = None
+    previous_mask = None
 
     try:
         for i in range(len(reader.color_files)):
             color, frame_name, H, W = reader.get_color(i), reader.id_strs[i] + ".png", reader.get_color(i).shape[0], reader.get_color(i).shape[1]
-            # 🌟 1. 同步 GPU 并计时起点
             torch.cuda.synchronize()
             t1 = time.time()
             
             with torch.no_grad():
-                pad_h, pad_w = (32 - H % 32) % 32, (32 - W % 32) % 32
-                img_padded = cv2.copyMakeBorder(color, 0, pad_h, 0, pad_w, cv2.BORDER_CONSTANT, value=(0,0,0))
-                
-                # 🌟 核心修复 1：严格执行 ImageNet 归一化
-                tensor_expert = torch.from_numpy(cv2.cvtColor(img_padded, cv2.COLOR_BGR2RGB)).float().permute(2,0,1).unsqueeze(0).to(device) / 255.0
-                tensor_expert = (tensor_expert - mean) / std
-                
-                m_logits, d_preds = model_expert(tensor_expert)
-                
-                m_np = (torch.sigmoid(m_logits) > 0.5).squeeze().cpu().numpy()[:H, :W]
-                d_np = d_preds.squeeze().cpu().numpy()[:H, :W]
-                
-                # 🌟 核心修复 2：极简 Mask 清洗，杜绝形态学污染
-                binary_mask = m_np.astype(np.uint8)
-                num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary_mask, connectivity=8)
-                
-                if num_labels > 1:
-                    largest_label = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
-                    current_mask = (labels == largest_label).astype(bool)
+                if i == 0:
+                    if args.use_pred_init:
+                        initial_mask_path = os.path.join(args.test_scene_dir, "mask", reader.id_strs[i] + ".png")
+                        initial_mask = cv2.imread(initial_mask_path, cv2.IMREAD_GRAYSCALE) > 0 
+                        ys, xs = np.where(initial_mask)
+                        x_min, x_max = xs.min(), xs.max()
+                        y_min, y_max = ys.min(), ys.max()
+                        w = max(x_max - x_min, 10)
+                        h = max(y_max - y_min, 10)
+                    else:
+                        pose_gt = np.load(os.path.join(args.test_scene_dir, "annotated_pose", reader.id_strs[i] + ".npy"))
+                        previous_pose = pose_gt
+                        x_min, y_min, w, h = get_bbox_from_pose(previous_pose, reader.K, mesh.vertices)
+
                 else:
-                    current_mask = binary_mask.astype(bool)
+                    ys, xs = np.where(previous_mask)
+                    if len(xs) > 10:  
+                        x_min, x_max = xs.min(), xs.max()
+                        y_min, y_max = ys.min(), ys.max()
+                        w = max(x_max - x_min, 10)
+                        h = max(y_max - y_min, 10)
+                    else: 
+                        x_min, y_min, w, h = get_bbox_from_pose(previous_pose, reader.K, mesh.vertices)
+                
+                c_x, c_y = x_min + w / 2.0, y_min + h / 2.0
+                crop_size = max(w, h) * 1.2
+                
+                M = cv2.getRotationMatrix2D((c_x, c_y), 0, 160.0 / crop_size)
+                M[0, 2] += 80.0 - c_x
+                M[1, 2] += 80.0 - c_y
+                
+                rgb_crop = cv2.warpAffine(color, M, (160, 160), flags=cv2.INTER_LINEAR, borderValue=(0,0,0))
+                rgb_tensor = torch.from_numpy(rgb_crop).float().permute(2,0,1) / 255.0
+                
+                M_3x3 = np.vstack([M, [0, 0, 1]])
+                K_crop = M_3x3 @ reader.K
+                K_inv = np.linalg.inv(K_crop)
+                u, v = np.meshgrid(np.arange(160), np.arange(160))
+                uv1 = np.stack([u, v, np.ones_like(u)], axis=-1).reshape(-1, 3)
+                unnorm_rays = (K_inv @ uv1.T).T.reshape(160, 160, 3)
+                ray_map = unnorm_rays / np.linalg.norm(unnorm_rays, axis=-1, keepdims=True)
+                ray_tensor = torch.from_numpy(ray_map).float().permute(2,0,1)
+                
+                dynamic_physical_width = extents.max()
+                # ==========================================================
+                # 🌟 形状-尺度解耦推理策略
+                # 全局尺度由 ICP + 3D 物理模型锚定，网络只做相对形状 + ±15% 微调
+                # ==========================================================
+                if i == 0 or previous_pose is None:
+                    # 首帧
+                    if args.use_pred_init:
+                        # 🌟 无gtpose的真实推理模式：用公式估算（bbox+焦距）
+                        cos_theta = 1.0
+                        Z_base = reader.K[0, 0] * (dynamic_physical_width / max(w, h)) * cos_theta
+                    else:
+                        # 🌟 有gtpose的评估模式：直接用gtpose的Z分量，最准确（偏差<1%）
+                        # 网络只需做极小修正，ICP再精细对齐
+                        Z_base = pose_gt[2, 3]* 0.84
+                else:
+                    # 🌟 稳定追踪态：直接继承上一帧ICP解算的真实物理Z
+                    # 这是最精准的基准，网络delta_z只需做小范围微调
+                    Z_base = previous_pose[2, 3]* 0.84
+                # ==========================================================
+                
+                # 🌟 Z_base作为第7通道输入：归一化到0~1（除以0.2m），和训练一致
+                z_base_norm = torch.full((1, 160, 160), Z_base / 0.2, dtype=torch.float32)
+                # 🌟 所有张量统一移到GPU再cat，确保设备一致
+                inputs_6c = torch.cat([rgb_tensor.to(device), ray_tensor.to(device), z_base_norm.to(device)], dim=0).unsqueeze(0)  # 实际7通道
+                
+                if args.use_gt_depth:
+                    # 🌟 GT深度模式：用GT深度代替预测深度，验证FoundationPose本身能不能跟住
+                    # 跳过网络推理，直接加载GT深度并crop到160x160
+                    depth_gt_path = os.path.join(gt_depth_dir, f"{reader.id_strs[i]}.npy")
+                    if os.path.exists(depth_gt_path):
+                        depth_gt_full = np.load(depth_gt_path).astype(np.float32)
+                        # 用同样的M矩阵crop到160x160，和预测深度保持一致
+                        depth_crop_np = cv2.warpAffine(depth_gt_full, M, (160, 160), flags=cv2.INTER_NEAREST, borderValue=0)
+                        mask_crop_np = (depth_crop_np > 0).astype(np.uint8)
+                        valid_gt = depth_crop_np[depth_crop_np > 0]
+                        if len(valid_gt) > 0:
+                            print(f"[GT深度模式] 帧{i:04d} GT深度 | 均值: {valid_gt.mean():.4f} | 最小: {valid_gt.min():.4f} | 最大: {valid_gt.max():.4f} | 跨度: {valid_gt.max()-valid_gt.min():.4f}")
+                    else:
+                        print(f"[GT深度模式] ⚠️ 找不到GT深度: {depth_gt_path}，用零深度代替")
+                        depth_crop_np = np.zeros((160, 160), dtype=np.float32)
+                        mask_crop_np = np.zeros((160, 160), dtype=np.uint8)
+                else:
+                    # 🌟 正常模式：用学生网络预测深度
+                    shape_weight_raw, mask_pred, delta_z_scalar = model_expert(inputs_6c)
+                    
+                    shape_weight = torch.tanh(shape_weight_raw) * dynamic_physical_width * SHAPE_SCALE_RATIO
+                    
+                    # 🌟 硬约束：强制减掉shape在预测mask内的均值，和训练完全一致
+                    # 确保shape只表达局部起伏，不携带全局偏移
+                    mask_for_mean = (mask_pred > 0.5).float()
+                    shape_mean_val = (shape_weight * mask_for_mean).sum(dim=[1,2,3], keepdim=True) / (mask_for_mean.sum(dim=[1,2,3], keepdim=True) + 1e-8)
+                    shape_weight = shape_weight - shape_mean_val
+                    
+                    delta_z_rel = torch.tanh(delta_z_scalar.view(-1, 1, 1, 1)) * MAX_Z_RATIO
+                    print(f"delta_z_rel: {delta_z_rel.item()*100:.2f}%")
+                    z_global = Z_base * (1.0 + delta_z_rel)
+                    
+                    D_pred = z_global + shape_weight
+                    
+                    mask_crop_np = (mask_pred[0, 0] > 0.5).cpu().numpy().astype(np.uint8)
+                    depth_crop_np = D_pred[0, 0].cpu().numpy()
+                    depth_crop_np = depth_crop_np * mask_crop_np
+                
+                M_inv = cv2.invertAffineTransform(M)
+                full_mask = cv2.warpAffine(mask_crop_np, M_inv, (W, H), flags=cv2.INTER_NEAREST, borderValue=0)
+                full_depth = cv2.warpAffine(depth_crop_np, M_inv, (W, H), flags=cv2.INTER_NEAREST, borderValue=0)
+                
+                current_mask = full_mask.astype(bool)
+                current_depth = full_depth
+                previous_mask = current_mask
+                # 🌟 新增：输出预测深度统计
+                valid_depth_vals = current_depth[current_mask]
+                if len(valid_depth_vals) > 0:
+                    depth_mean = np.mean(valid_depth_vals)
+                    depth_min = np.min(valid_depth_vals)
+                    depth_max = np.max(valid_depth_vals)
+                    print(f"🔍 帧{i:04d} 预测深度 | 均值: {depth_mean:.4f} | 最小: {depth_min:.4f} | 最大: {depth_max:.4f} | 跨度: {depth_max - depth_min:.4f}")
 
-                # 严格按照 test_joint_physical.py：直接裁剪，绝不引入背景的垃圾深度
-                current_depth = d_np * current_mask
-
-            # 🌟 核心修复 3：移除兜底逻辑，百分百信任物理回归模型
             with SuppressPrint(): 
-                # 1. 严格同步 GPU 并记录 track 起点
                 torch.cuda.synchronize()
                 t_track_start = time.time()
                 
-                if i == 0:
-                    pose_gt = np.load(os.path.join(args.test_scene_dir, "annotated_pose", reader.id_strs[i] + ".npy"))
-                    est.pose_last = torch.tensor(pose_gt @ np.linalg.inv(est.get_tf_to_centered_mesh().data.cpu().numpy().reshape(4, 4)), device=device, dtype=torch.float32).unsqueeze(0)
-                    est.track_one(rgb=color, depth=current_depth, K=reader.K, iteration=1)
-                    pose = pose_gt
+                tf_to_centered = est.get_tf_to_centered_mesh().data.cpu().numpy().reshape(4, 4)
+                
+                if args.use_gtpose_every_frame:
+                    # 🌟 每帧都用gtpose初始化然后refine，验证FoundationPose的refine能力
+                    # 加载当前帧的gtpose
+                    pose_gt_cur_path = os.path.join(gt_pose_dir, f"{reader.id_strs[i]}.npy")
+                    if os.path.exists(pose_gt_cur_path):
+                        pose_gt_cur = np.load(pose_gt_cur_path).astype(np.float32)
+                        if args.est_refine_iter <= 0:
+                            # 不refine，直接用gtpose作为输出（验证refine是否是元凶）
+                            pose = pose_gt_cur.copy()
+                            # 同时设置est.pose_last，以防后续帧需要调用track_one
+                            est.pose_last = torch.tensor(pose_gt_cur @ np.linalg.inv(tf_to_centered), device=device, dtype=torch.float32).unsqueeze(0)
+                            print(f"[gtpose每帧初始化] 帧{i:04d} 不refine，直接用gtpose（ADD应为0）")
+                        else:
+                            # 用gtpose作为初始位姿（转成居中坐标系）
+                            est.pose_last = torch.tensor(pose_gt_cur @ np.linalg.inv(tf_to_centered), device=device, dtype=torch.float32).unsqueeze(0)
+                            # 调用refine，用est_refine_iter次迭代
+                            pose_centered = est.track_one(rgb=color, depth=current_depth, K=reader.K, iteration=args.est_refine_iter)
+                            # 转回原始坐标系
+                            pose = pose_centered @ tf_to_centered
+                            # 计算refine前后的误差（refine前就是gtpose，误差为0；refine后和gtpose对比）
+                            refine_diff = np.linalg.norm(pose[:3, 3] - pose_gt_cur[:3, 3]) * 1000
+                            print(f"[gtpose每帧初始化] 帧{i:04d} refine后与gtpose平移差: {refine_diff:.2f}mm")
+                    else:
+                        # 找不到gtpose，用上一帧位姿作为输出（不调用track_one，避免报错）
+                        if previous_pose is not None:
+                            pose = previous_pose.copy()
+                            print(f"[gtpose每帧初始化] ⚠️ 帧{i:04d} 找不到gtpose，沿用上一帧位姿")
+                        else:
+                            pose = np.eye(4, dtype=np.float32)
+                            print(f"[gtpose每帧初始化] ⚠️ 帧{i:04d} 找不到gtpose且无上一帧，用单位矩阵")
+                elif i == 0:
+                    if args.use_pred_init:
+                        sys.stderr.write("\n🚀 启动零样本纯几何粗筛定位...\n")
+                        
+                        initial_pose_cam2world = matcher.match(mask_crop_np, depth_crop_np)
+                        
+                        if initial_pose_cam2world is not None:
+                            sys.stderr.write("✅ 几何粗筛成功！利用预测深度图解算真实物理平移(T)...\n")
+                            
+                            obj2cam_template = np.linalg.inv(initial_pose_cam2world)
+                            R_pred = obj2cam_template[:3, :3]
+                            
+                            valid_depth = current_depth[current_mask]
+                            real_tz = np.median(valid_depth) if len(valid_depth) > 0 else 0.1 
+                            
+                            real_tx = (c_x - reader.K[0, 2]) * real_tz / reader.K[0, 0]
+                            real_ty = (c_y - reader.K[1, 2]) * real_tz / reader.K[1, 1]
+                            
+                            real_initial_pose = np.eye(4, dtype=np.float32)
+                            real_initial_pose[:3, :3] = R_pred
+                            real_initial_pose[:3, 3] = [real_tx, real_ty, real_tz]
+                            
+                            est.pose_last = torch.tensor(real_initial_pose, device=device, dtype=torch.float32).unsqueeze(0)
+                            
+                            pose_centered = est.track_one(rgb=color, depth=current_depth, K=reader.K, iteration=args.est_refine_iter)
+                            pose = pose_centered @ est.get_tf_to_centered_mesh().data.cpu().numpy().reshape(4, 4)
+                        else:
+                            sys.stderr.write("❌ 警告：未匹配到任何有效模板！\n")
+                            pose = np.eye(4)
+
+                    else:
+                        est.pose_last = torch.tensor(pose_gt @ np.linalg.inv(est.get_tf_to_centered_mesh().data.cpu().numpy().reshape(4, 4)), device=device, dtype=torch.float32).unsqueeze(0)
+                        est.track_one(rgb=color, depth=current_depth, K=reader.K, iteration=1)
+                        pose = pose_gt
                 else:
                     pose = est.track_one(rgb=color, depth=current_depth, K=reader.K, iteration=args.track_refine_iter) @ est.get_tf_to_centered_mesh().data.cpu().numpy().reshape(4, 4)
                 
-                # 2. 严格同步 GPU 并记录 track 终点
+                previous_pose = pose
+                
                 torch.cuda.synchronize()
                 t_track_end = time.time()
                 track_time_ms = (t_track_end - t_track_start) * 1000.0
-            # ==========================================================
-            # 🌟 3. 同步 GPU 并计时终点
+                all_track_times.append(track_time_ms)
+
             torch.cuda.synchronize()
             t2 = time.time()
-            # 🌟 新增：记录当前帧计算耗时 (ms)
             frame_time_ms = (t2 - t1) * 1000.0
             all_frame_times.append(frame_time_ms)
+            
+            mask_crop_255 = mask_crop_np * 255
+            vis_rgb = cv2.cvtColor(rgb_crop.astype(np.uint8), cv2.COLOR_RGB2BGR)
+            vis_mask_3c = cv2.cvtColor(mask_crop_255, cv2.COLOR_GRAY2BGR)
+            vis_depth = get_auto_color(depth_crop_np, mask_crop_255)
+            
+            concat_img = np.hstack([vis_rgb, vis_mask_3c, vis_depth])
+            cv2.putText(concat_img, 'Crop RGB', (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            cv2.putText(concat_img, 'Pred Mask', (170, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            cv2.putText(concat_img, 'Pred Depth', (330, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            cv2.imwrite(os.path.join(mask_depth_output_dir, f"{reader.id_strs[i]}.png"), concat_img)
+            
             vis = create_visualization(color, pose, to_origin, reader.K, bbox, fps=1/(t2-t1), render_3d=True, mesh_dir=os.path.dirname(args.mesh_file), main_mesh=mesh, center_pose=pose @ np.linalg.inv(to_origin))
             
             frame_error = None
-            if ball_centroids is not None and frame_name in gt_data:
-                try:
-                    rvec_v, _ = cv2.Rodrigues(pose[:3,:3]); tvec_v = pose[:3,3]
-                    pts_proj, _ = cv2.projectPoints(ball_centroids, rvec_v, tvec_v, reader.K, None)
-                    pts_gt = np.array([gt_data[frame_name][f'ball_{j}'] for j in range(1, 5)], dtype=np.float32)
-                    from scipy.spatial.distance import cdist; from scipy.optimize import linear_sum_assignment
-                    dist_matrix = cdist(pts_proj.squeeze(), pts_gt)
-                    row_ind, col_ind = linear_sum_assignment(dist_matrix)
-                    frame_error = dist_matrix[row_ind, col_ind].mean()
-                    all_frame_errors.append(frame_error)
-                    cv2.putText(vis, f"Err: {frame_error:.2f}px", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,165,255), 2)
-                except: pass
-            # =========================================================
-            # 🌟 新增：全维度 GT 数据拉取与测评 (TE, RE, ADD, IoU, MAE)
-            # =========================================================
-            err_str = f" | Err: {frame_error:.4f} px" if frame_error is not None else " | Err: N/A"
-            val_str = f"{frame_error:.4f}" if frame_error is not None else "N/A"
+            err_str = " | 纯推理模式"
+            val_str = "N/A"
             
-            # 拼接读取路径，这里用 id_strs 作为文件名
-            pose_gt_path = os.path.join(gt_pose_dir, f"{reader.id_strs[i]}.npy")
-            depth_gt_path = os.path.join(gt_depth_dir, f"{reader.id_strs[i]}.npy")
-            
-            if os.path.exists(pose_gt_path) and os.path.exists(depth_gt_path):
-                pose_gt_val = np.load(pose_gt_path)
+            if not args.no_eval:
+                if ball_centroids is not None and frame_name in gt_data:
+                    try:
+                        rvec_v, _ = cv2.Rodrigues(pose[:3,:3]); tvec_v = pose[:3,3]
+                        pts_proj, _ = cv2.projectPoints(ball_centroids, rvec_v, tvec_v, reader.K, None)
+                        pts_gt = np.array([gt_data[frame_name][f'ball_{j}'] for j in range(1, 5)], dtype=np.float32)
+                        from scipy.spatial.distance import cdist; from scipy.optimize import linear_sum_assignment
+                        dist_matrix = cdist(pts_proj.squeeze(), pts_gt)
+                        row_ind, col_ind = linear_sum_assignment(dist_matrix)
+                        frame_error = dist_matrix[row_ind, col_ind].mean()
+                        all_frame_errors.append(frame_error)
+                        cv2.putText(vis, f"Err: {frame_error:.2f}px", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,165,255), 2)
+                    except: pass
                 
-                # 读取深度 GT 
-                depth_gt_val = np.load(depth_gt_path) 
-                # 🚨 如果你的 depth 是 PNG 格式，请注销上一行，使用下面这行(假设归一化系数为1000):
-                # depth_gt_val = cv2.imread(depth_gt_path, cv2.IMREAD_UNCHANGED).astype(np.float32) / 1000.0
+                pose_gt_path = os.path.join(gt_pose_dir, f"{reader.id_strs[i]}.npy")
+                depth_gt_path = os.path.join(gt_depth_dir, f"{reader.id_strs[i]}.npy")
                 
-                # --- 1. 计算 3D 物理误差 ---
-                te_val = calc_te(pose, pose_gt_val)
-                re_val = calc_re(pose, pose_gt_val)
-                add_val = calc_add(pose, pose_gt_val, mesh.vertices)
-                
-                eval_metrics['TE'].append(te_val)
-                eval_metrics['RE'].append(re_val)
-                eval_metrics['ADD'].append(add_val)
-                
-                # --- 2. 计算 2D Mask & Depth 误差 ---
-                # 统一尺寸防崩溃
-                if depth_gt_val.shape != current_mask.shape:
-                    depth_gt_val = cv2.resize(depth_gt_val, (W, H), interpolation=cv2.INTER_NEAREST)
-                
-                gt_mask_val = depth_gt_val > 0
-                
-                # 计算 IoU
-                intersection = np.logical_and(gt_mask_val, current_mask).sum()
-                union = np.logical_or(gt_mask_val, current_mask).sum()
-                iou_val = intersection / union if union > 0 else 0
-                eval_metrics['IoU'].append(iou_val)
-                
-                # 计算 Depth MAE (仅在 GT 有效范围内计算，转换成毫米)
-                if gt_mask_val.sum() > 0:
-                    mae_val = np.abs(current_depth[gt_mask_val] - depth_gt_val[gt_mask_val]).mean() * 1000.0
-                    eval_metrics['MAE'].append(mae_val)
-                else:
-                    mae_val = 0.0
+                if os.path.exists(pose_gt_path) and os.path.exists(depth_gt_path):
+                    pose_gt_val = np.load(pose_gt_path)
+                    depth_gt_val = np.load(depth_gt_path) 
                     
-                # 丰富控制台日志
-                err_str += f" | ADD:{add_val:.2f}mm | IoU:{iou_val:.2f}"
-                val_str += f",{te_val:.4f},{re_val:.4f},{add_val:.4f},{iou_val:.4f},{mae_val:.4f}"
-            else:
-                # 缺失真值时留空占位
-                val_str += ",N/A,N/A,N/A,N/A,N/A"
-            # =========================================================
+                    te_val = calc_te(pose, pose_gt_val)
+                    re_val = calc_re(pose, pose_gt_val)
+                    add_val = calc_add(pose, pose_gt_val, mesh.vertices)
+                    
+                    eval_metrics['TE'].append(te_val)
+                    eval_metrics['RE'].append(re_val)
+                    eval_metrics['ADD'].append(add_val)
+                    
+                    if depth_gt_val.shape != current_mask.shape:
+                        depth_gt_val = cv2.resize(depth_gt_val, (W, H), interpolation=cv2.INTER_NEAREST)
+                    
+                    gt_mask_val = depth_gt_val > 0
+                    intersection = np.logical_and(gt_mask_val, current_mask).sum()
+                    union = np.logical_or(gt_mask_val, current_mask).sum()
+                    iou_val = intersection / union if union > 0 else 0
+                    eval_metrics['IoU'].append(iou_val)
+                    
+                    if gt_mask_val.sum() > 0:
+                        mae_val = np.abs(current_depth[gt_mask_val] - depth_gt_val[gt_mask_val]).mean() * 1000.0
+                        eval_metrics['MAE'].append(mae_val)
+                    else:
+                        mae_val = 0.0
+                        
+                    err_str = f" | Err: {frame_error:.4f}px | ADD:{add_val:.2f}mm | IoU:{iou_val:.2f}" if frame_error else f" | ADD:{add_val:.2f}mm | IoU:{iou_val:.2f}"
+                    val_str = f"{frame_error:.4f},{te_val:.4f},{re_val:.4f},{add_val:.4f},{iou_val:.4f},{mae_val:.4f}" if frame_error else f"N/A,{te_val:.4f},{re_val:.4f},{add_val:.4f},{iou_val:.4f},{mae_val:.4f}"
+                else:
+                    err_str = f" | Err: {frame_error:.4f}px" if frame_error else " | 无GT数据"
+                    val_str = f"{frame_error:.4f},N/A,N/A,N/A,N/A,N/A" if frame_error else "N/A,N/A,N/A,N/A,N/A,N/A"
+                
             cv2.imwrite(os.path.join(img_output_dir, f"{reader.id_strs[i]}.png"), vis[..., ::-1])
             video_writer.write(vis[..., ::-1])
             
-            err_str = f" | Err: {frame_error:.4f} px" if frame_error is not None else " | Err: N/A"
             real_frame_id = i + 1
-            # 🌟 打印时把 track 耗时单独列出来！
-            print(f"🔹 帧 {real_frame_id:04d} 完成 | Track 耗时: {track_time_ms:.1f}ms | 总耗时: {frame_time_ms:.1f}ms{err_str}")
-            # 🌟 新增：结构化写入 txt（帧号,误差），若无 GT 则记录为 N/A
-            val_str = f"{frame_error:.4f}" if frame_error is not None else "N/A"
+            print(f"🔹 帧 {real_frame_id:04d} 完成 | Track: {track_time_ms:.1f}ms | Total: {frame_time_ms:.1f}ms{err_str}")
             txt_file.write(f"{real_frame_id},{val_str}\n")
-            txt_file.flush()  # 强行刷新缓冲区，防止意外中断时数据丢失
+            txt_file.flush() 
 
-            # =================================================================
-            # 🌟 新增：第 800 帧时的中期大盘数据播报
-            # =================================================================
-            if real_frame_id == 800 and all_frame_errors:
+            if not args.no_eval and real_frame_id == 800 and all_frame_errors:
                 err_arr = np.array(all_frame_errors)
-                mean_err = np.mean(err_arr)
-                median_err = np.median(err_arr)
-                rate_2px = np.sum(err_arr < 2.0) / len(err_arr) * 100
-                rate_3px = np.sum(err_arr < 3.0) / len(err_arr) * 100
-                
                 print("\n" + "="*50)
                 print("⏳ 前 800 帧 追踪统计")
-                print(f"📊 平均像素误差 (Mean):   {mean_err:.4f} px")
-                print(f"📈 中位数误差 (Median): {median_err:.4f} px")
-                print(f"✨ 极高精度比例 (<2px):  {rate_2px:.2f}%")
-                print(f"✨ 优秀精度比例 (<3px):  {rate_3px:.2f}%")
+                print(f"📊 平均像素误差 (Mean):   {np.mean(err_arr):.4f} px")
+                print(f"📈 中位数误差 (Median): {np.median(err_arr):.4f} px")
+                print(f"✨ 极高精度比例 (<2px):  {np.sum(err_arr < 2.0) / len(err_arr) * 100:.2f}%")
+                print(f"✨ 优秀精度比例 (<3px):  {np.sum(err_arr < 3.0) / len(err_arr) * 100:.2f}%")
                 print("="*50 + "\n")
 
     finally:
         video_writer.release()
         if 'txt_file' in locals() and not txt_file.closed:
-            if all_frame_errors:
-                err_arr = np.array(all_frame_errors)
-                
-                # 计算各种阈值下的 PCK (Percentage of Correct Keypoints)
-                pck_2px = np.sum(err_arr < 2.0) / len(err_arr) * 100
-                pck_3px = np.sum(err_arr < 3.0) / len(err_arr) * 100
-                pck_10px = np.sum(err_arr < 10.0) / len(err_arr) * 100
-                
-                txt_file.write("\n" + "="*60 + "\n")
-                txt_file.write("🏆 [视觉特征能力] 大盘留档统计\n")
-                txt_file.write(f"📊 2D 重投影误差 (Mean):  {np.mean(err_arr):.4f} px\n")
-                txt_file.write(f"✨ PCK @ 2px (微雕精度): {pck_2px:.2f}%\n")
-                txt_file.write(f"✨ PCK @ 3px (极高精度): {pck_3px:.2f}%\n")
-                txt_file.write(f"✨ PCK @ 10px (抗脱轨率): {pck_10px:.2f}%\n")
-                txt_file.write("="*60 + "\n")
-                
-                # 只有当成功读取到物理位姿真值时，才打印以下报告
+            if not args.no_eval:
+                if all_frame_errors:
+                    err_arr = np.array(all_frame_errors)
+                    txt_file.write("\n" + "="*60 + "\n")
+                    txt_file.write("🏆 [视觉特征能力] 大盘留档统计\n")
+                    txt_file.write(f"📊 2D 重投影误差 (Mean):  {np.mean(err_arr):.4f} px\n")
+                    txt_file.write(f"✨ PCK @ 2px (微雕精度): {np.sum(err_arr < 2.0) / len(err_arr) * 100:.2f}%\n")
+                    txt_file.write(f"✨ PCK @ 3px (极高精度): {np.sum(err_arr < 3.0) / len(err_arr) * 100:.2f}%\n")
+                    txt_file.write(f"✨ PCK @ 10px (抗脱轨率): {np.sum(err_arr < 10.0) / len(err_arr) * 100:.2f}%\n")
+                    txt_file.write("="*60 + "\n")
+                    
                 if len(eval_metrics['TE']) > 0:
                     txt_file.write("\n" + "="*60 + "\n")
                     txt_file.write("🏆 [物理位姿级] 大盘留档统计\n")
@@ -295,18 +466,17 @@ if __name__ == "__main__":
                     txt_file.write(f"🎯 掩码重合度 (Mask IoU): {np.mean(eval_metrics['IoU']):.4f}\n")
                     txt_file.write(f"📏 深度预测误差 (Depth MAE): {np.mean(eval_metrics['MAE']):.4f} mm\n")
                     txt_file.write("="*60 + "\n")
-                # =========================================================
-                # 🌟 新增：系统推理与时间性能统计
-                # =========================================================
-                if len(all_frame_times) > 0:
-                    avg_time_ms = np.mean(all_frame_times)
-                    fps = 1000.0 / avg_time_ms if avg_time_ms > 0 else 0
-                    
-                    txt_file.write("\n" + "="*60 + "\n")
-                    txt_file.write("🏆 [系统推理性能] 大盘留档统计\n")
-                    txt_file.write(f"🎞️ 总处理帧数 (Total Frames): {len(all_frame_times)} 帧\n")
-                    txt_file.write(f"⏱️ 平均单帧耗时 (Avg Latency): {avg_time_ms:.2f} ms\n")
-                    txt_file.write(f"🚀 等效运行帧率 (Equivalent FPS): {fps:.2f} FPS\n")
-                    txt_file.write("="*60 + "\n")
+            
+            if len(all_frame_times) > 0:
+                avg_time_ms = np.mean(all_frame_times)
+                avg_track_time_ms = np.mean(all_track_times) if len(all_track_times) > 0 else 0
+                fps = 1000.0 / avg_time_ms if avg_time_ms > 0 else 0
+                txt_file.write("\n" + "="*60 + "\n")
+                txt_file.write("🏆 [系统推理性能] 大盘留档统计\n")
+                txt_file.write(f"🎞️ 总处理帧数 (Total Frames): {len(all_frame_times)} 帧\n")
+                txt_file.write(f"⏱️ 平均 Track 耗时 (Avg Track Latency): {avg_track_time_ms:.2f} ms\n")
+                txt_file.write(f"⏱️ 平均单帧总耗时 (Avg Total Latency): {avg_time_ms:.2f} ms\n")
+                txt_file.write(f"🚀 等效运行帧率 (Equivalent FPS): {fps:.2f} FPS\n")
+                txt_file.write("="*60 + "\n")
                 
             txt_file.close()
