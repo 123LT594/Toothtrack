@@ -96,14 +96,19 @@ def render_gt_depth_map(pose, K, H, W, glctx, mesh_tensors):
     return d
 
 def get_auto_color(d_np, mask_uint8):
-    m_np = mask_uint8 > 127
+    """按mask内有效米制深度自动着色；无效/背景为黑，不改变输入深度。
+
+    GT渲染mask与保存深度的轮廓可能略有差别，不能把mask内的0纳入色阶。
+    各帧独立min/max仅用于观察形状，不能用颜色横比绝对距离。
+    """
+    m_np = (mask_uint8 > 127) & np.isfinite(d_np) & (d_np >= DEPTH_VALID_MIN)
     vis = np.zeros_like(d_np, dtype=np.uint8)
     if m_np.sum() > 0:
         valid = d_np[m_np]
         p_min, p_max = valid.min(), valid.max()
         if p_max - p_min > 1e-4:
-            norm = np.clip((d_np - p_min) / (p_max - p_min), 0, 1)
-            vis = (norm * 255).astype(np.uint8)
+            norm = np.clip((valid - p_min) / (p_max - p_min), 0, 1)
+            vis[m_np] = (norm * 255).astype(np.uint8)
         else:
             vis[m_np] = 127
     color = cv2.applyColorMap(vis, cv2.COLORMAP_JET)
@@ -469,13 +474,13 @@ if __name__ == "__main__":
     # depth_src:
     #   dav2    -> Depth Anything V2 全图米制深度
     #   gt      -> GT 渲染深度（oracle）
-    #   distill -> 旧 StudentDepthNet（160 crop，固定使用网络预测mask门控）
+    #   distill -> 最终7通道 StudentDepthNet（160 crop，固定使用网络预测mask门控）
     # use_gt_mask: 用 GT 位姿渲染的精确牙齿 silhouette 把深度背景清零（门控）。
     #   四版本：
     #     dav2（无flag）          = DAv2 预测深度，全图无门控（现状 baseline）
     #     dav2 + --use_gt_mask    = DAv2 预测深度 + GT mask（门控上界，路A决定性实验）
     #     gt   + --use_gt_mask    = GT 深度 + GT mask（oracle 参考输入）
-    #     distill                = 旧蒸馏 StudentDepthNet 深度 + 预测mask
+    #     distill                = 最终7通道 StudentDepthNet 深度 + 预测mask
     parser.add_argument("--depth_src", type=str, default=None, choices=["dav2", "gt", "distill"])
     parser.add_argument("--use_dav2", action='store_true', help="[兼容旧命令] 等价 --depth_src dav2")
     parser.add_argument("--use_gt_mask", action='store_true', help="用 GT 位姿渲染的 mask 把深度背景清零（门控）")
@@ -491,9 +496,13 @@ if __name__ == "__main__":
 
     parser.add_argument('--eval_boundary_px', type=int, default=3,
                         help='评估用牙齿内边界带宽度（原图像素，不改变追踪）')
+    parser.add_argument('--student_z_base_scale', type=float, default=0.84,
+                        help='Student推理时pose Z到Z_base的经验系数；默认复现当前baseline')
     parser.add_argument('--no_backend_metrics', action='store_true',
                         help='关闭后端张量快照，仅用于减少诊断计时开销；不改变追踪结果')
     args = parser.parse_args()
+    if not np.isfinite(args.student_z_base_scale) or args.student_z_base_scale <= 0:
+        parser.error('--student_z_base_scale 必须为有限正数')
     if args.eval_boundary_px < 1:
         parser.error('--eval_boundary_px 必须 >= 1')
 
@@ -560,14 +569,26 @@ if __name__ == "__main__":
         print(f"   ✅ DAv2 已加载: {args.dav2_ckpt} (max_depth={args.dav2_max_depth})")
     elif args.depth_src == "distill":
         print("🚀 加载 3D 蒸馏基座 (StudentDepthNet)...")
+        student_state = torch.load(args.weight_student, map_location='cpu')
+        if isinstance(student_state, dict) and 'model_state_dict' in student_state:
+            student_state = student_state['model_state_dict']
+        stem_key = 'backbone.features.0.0.weight'
+        if not isinstance(student_state, dict) or stem_key not in student_state:
+            raise RuntimeError('Student权重缺少首层参数；请使用本次训练的state_dict或model_state_dict检查点')
+        checkpoint_channels = int(student_state[stem_key].shape[1])
+        if checkpoint_channels != 7:
+            raise RuntimeError(f'当前distill要求最终7通道权重，检查点为{checkpoint_channels}通道；请核对 --weight_student')
         model_expert = StudentDepthNet().to(device)
-        model_expert.load_state_dict(torch.load(args.weight_student, map_location=device))
-        model_expert.eval()
         student_in_channels = int(model_expert.backbone.features[0][0].in_channels)
-        if student_in_channels not in (6, 7):
-            raise RuntimeError(f"StudentDepthNet首层输入通道应为6或7，实际为{student_in_channels}")
-        print(f"   ✅ StudentDepthNet 输入通道: {student_in_channels} "
-              f"({'RGB+Ray' if student_in_channels == 6 else 'RGB+Ray+Z_base'})")
+        if student_in_channels != 7:
+            raise RuntimeError(f'当前StudentDepthNet为{student_in_channels}通道，请同步最终7通道模型文件')
+        model_expert.load_state_dict(student_state, strict=True)
+        model_expert.eval()
+        print('   ✅ StudentDepthNet: 7通道 RGB+Ray+Z_base/0.2，权重严格加载成功')
+        txt_file.write(f'# student: checkpoint={args.weight_student} channels=7 '
+                       f'z_base_scale={args.student_z_base_scale} z_input_normalizer_m=0.2 '
+                       f'MAX_Z_RATIO={MAX_Z_RATIO} SHAPE_SCALE_RATIO={SHAPE_SCALE_RATIO} '
+                       'shape_center=predicted_mask_mean mask_threshold=0.5\n')
 
     gt_data = {}
     ball_centroids = None
@@ -695,22 +716,30 @@ if __name__ == "__main__":
                     ray_tensor = torch.from_numpy(ray_map).float().permute(2,0,1)
 
                     dynamic_physical_width = extents.max()
+                    # ==========================================================
+                    # Z_base 推理协议（默认复现 run_demo_joint_baseline）
+                    # 训练时 Z_base ≈ 牙齿GT深度中位数(±15%噪声)；pose[2,3] 是 mesh
+                    # 原点的相机Z；经验系数不保证在不同距离/姿态下等于牙面中位深度。
+                    # ==========================================================
                     if i == 0 or previous_pose is None:
                         if args.use_pred_init:
-                            cos_theta = 1.0
+                            # 无GT的真实推理：bbox+焦距公式估算（cos_theta=1）
+                            Z_base = reader.K[0, 0] * (dynamic_physical_width / max(w, h))
                         else:
-                            cos_theta = max(abs(pose_gt[2, 2]), 0.5)
-                        Z_base = reader.K[0, 0] * (dynamic_physical_width / max(w, h)) * cos_theta
+                            # 首帧使用已授权的GT初始化；后续只使用上一帧预测位姿。
+                            Z_base = pose_gt[2, 3] * args.student_z_base_scale
                     else:
-                        Z_base = previous_pose[2, 3]
+                        # 追踪态：由上一帧FoundationPose输出提供基准Z。
+                        Z_base = previous_pose[2, 3] * args.student_z_base_scale
 
-                    # 旧权重按训练协议使用6通道RGB+Ray；同时兼容明确训练过的7通道模型。
-                    student_input_parts = [rgb_tensor, ray_tensor]
-                    if student_in_channels == 7:
-                        z_base_norm = torch.full(
-                            (1, 160, 160), float(Z_base) / 0.2, dtype=torch.float32)
-                        student_input_parts.append(z_base_norm)
-                    student_inputs = torch.cat(student_input_parts, dim=0).unsqueeze(0).to(device)
+                    # 最终蒸馏模型固定7通道 RGB+Ray+Z_base/0.2。
+                    # 与 run_demo_joint_baseline 一致：每个 part 先显式放到 device 再 cat，
+                    # 杜绝跨帧偶发的 cpu/cuda 混合设备报错。
+                    student_input_parts = [rgb_tensor.to(device), ray_tensor.to(device)]
+                    z_base_norm = torch.full(
+                        (1, 160, 160), float(Z_base) / 0.2, dtype=torch.float32, device=device)
+                    student_input_parts.append(z_base_norm)
+                    student_inputs = torch.cat(student_input_parts, dim=0).unsqueeze(0)
                     if student_inputs.shape[1] != student_in_channels:
                         raise RuntimeError(
                             f"Student输入构造为{student_inputs.shape[1]}通道，模型要求{student_in_channels}通道")
@@ -718,6 +747,13 @@ if __name__ == "__main__":
                     shape_weight_raw, mask_pred, delta_z_scalar = model_expert(student_inputs)
 
                     shape_weight = torch.tanh(shape_weight_raw) * dynamic_physical_width * SHAPE_SCALE_RATIO
+                    # 训练用GT mask求均值；推理使用预测mask，存在mask误差带来的分布差异。
+                    # 减掉 shape 在【预测mask】内的均值，
+                    # 让 shape 只表达局部起伏，全局偏移全部交给 delta_z 头承担。
+                    mask_for_mean = (mask_pred > 0.5).float()
+                    shape_mean_val = (shape_weight * mask_for_mean).sum(dim=[1, 2, 3], keepdim=True) / (
+                        mask_for_mean.sum(dim=[1, 2, 3], keepdim=True) + 1e-8)
+                    shape_weight = shape_weight - shape_mean_val
                     delta_z_rel = torch.tanh(delta_z_scalar.view(-1, 1, 1, 1)) * MAX_Z_RATIO
                     z_global = Z_base * (1.0 + delta_z_rel)
 
