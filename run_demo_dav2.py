@@ -1,6 +1,6 @@
 # DAv2 depth-error diagnosis + FoundationPose tracking.
-# Diagnostic metrics and visualizations never modify the depth sent to
-# FoundationPose or the tracker state.
+# Default diagnostics are read-only. --depth_experiment explicitly enables
+# GT-assisted, matched-support interventions; this is not deployable inference.
 import os
 import sys
 os.environ['OMP_NUM_THREADS'] = '1'
@@ -119,6 +119,10 @@ def save_full_triplet(path, color_rgb, mask_bool, depth, W):
 DEPTH_VALID_MIN = 0.001  # meters; matches the backend depth validity threshold
 
 METRIC_GROUPS = {
+    '受控深度实验（共同支持S；偏差单位mm）': [
+        'SupportPixels', 'SupportCoverage_pct', 'BiasOnSupport_mm',
+        'AppliedBias_mm', 'SupportRawMAE_mm', 'SupportInputMAE_mm',
+        'SupportInputBias_mm', 'SupportShapeMAE_mm'],
     '位姿误差（误差越低越好；平移分量有符号）': [
         'Err2D_px', 'Err2D_ID_px', 'TE_mm', 'TxError_mm', 'TyError_mm',
         'TzError_mm', 'RE_deg', 'ADD_mm', 'PoseIoU', 'PoseBBoxIoU'],
@@ -129,7 +133,7 @@ METRIC_GROUPS = {
         'BoundaryMAE_valid_mm', 'InteriorMAE_valid_mm',
         'BoundaryCoverage_pct', 'InteriorCoverage_pct',
         'RawDepthMAE_valid_mm', 'RawDepthCoverage_pct'],
-    'DAv2误差分解（只读诊断；GT模式为N/A）': [
+    'DAv2原始误差分解（受控oracle也计算；普通GT模式为N/A）': [
         'DAv2ErrorMean_mm', 'DAv2ErrorMedian_mm', 'DAv2ErrorStd_mm', 'DAv2ErrorP10_mm',
         'DAv2ErrorP90_mm', 'DAv2ErrorIQR_mm', 'DAv2AbsErrorP90_mm',
         'DAv2MeanCenteredMAE_mm', 'DAv2MedianCenteredMAE_mm',
@@ -151,7 +155,7 @@ FRAME_COLUMNS = [
     'has_gt_pose', 'has_gt_depth', 'gt_mask_fallback', 'input_mask_kind',
     'GTToothPixels', 'DepthValidPixels', 'BoundaryPixels', 'InteriorPixels',
     'Err2DPoints', 'BackendIterations', 'BackendStatus',
-] + METRIC_NAMES + ['notes']
+] + METRIC_NAMES + ['depth_experiment', 'support_sha256', 'prediction_sha256', 'gt_depth_sha256', 'notes']
 
 
 def valid_pose_for_eval(pose):
@@ -166,6 +170,69 @@ def frame_number_from_id(frame_id):
 
 def valid_depth_mask(depth):
     return np.isfinite(depth) & (depth >= DEPTH_VALID_MIN)
+
+
+def array_digest(array):
+    array = np.ascontiguousarray(array)
+    header = (str(array.shape) + str(array.dtype)).encode('ascii')
+    return hashlib.sha256(header + array.tobytes()).hexdigest()
+
+
+def build_bias_experiment(prediction, reference, rendered_mask, mode):
+    """Same S in all arms. No clipping, hole filling, or changes to local shape."""
+    if mode not in ('raw', 'bias_corrected', 'oracle'):
+        raise ValueError('Unknown depth experiment: ' + mode)
+    if prediction.ndim != 2 or prediction.shape != reference.shape or prediction.shape != rendered_mask.shape:
+        raise ValueError('Prediction, GT and rendered mask must share HxW')
+    support = np.asarray(rendered_mask, dtype=bool) & valid_depth_mask(reference) & valid_depth_mask(prediction)
+    if not support.any():
+        raise ValueError('Common support S is empty; refusing to change support or skip frame')
+    error = prediction[support].astype(np.float64) - reference[support].astype(np.float64)
+    bias = float(error.mean())
+    corrected = prediction[support].astype(np.float64) - bias
+    # Check in EVERY arm so a correction cannot silently lose pixels in only one arm.
+    if not valid_depth_mask(corrected.astype(np.float32)).all():
+        raise ValueError('Bias correction makes S invalid; no clipping or mode-specific masking allowed')
+    result = np.zeros(prediction.shape, dtype=np.float32)
+    if mode == 'raw':
+        result[support] = prediction[support]
+    elif mode == 'bias_corrected':
+        result[support] = corrected
+    else:
+        result[support] = reference[support]
+    final_error = (result[support].astype(np.float64) - reference[support]) * 1000.0
+    stats = dict(
+        SupportPixels=int(support.sum()),
+        SupportCoverage_pct=float(100.0 * support.sum() / valid_depth_mask(reference).sum()),
+        BiasOnSupport_mm=bias * 1000.0,
+        AppliedBias_mm=bias * 1000.0 if mode == 'bias_corrected' else 0.0,
+        SupportRawMAE_mm=float(np.abs(error).mean() * 1000.0),
+        SupportInputMAE_mm=float(np.abs(final_error).mean()),
+        SupportInputBias_mm=float(final_error.mean()),
+        SupportShapeMAE_mm=float(np.abs(final_error - final_error.mean()).mean()),
+        support_sha256=array_digest(support.astype(np.uint8)),
+        prediction_sha256=array_digest(np.asarray(prediction, dtype=np.float32)),
+        gt_depth_sha256=array_digest(np.asarray(reference, dtype=np.float32)),
+    )
+    return result, support, stats
+
+
+def parse_snapshot_frames(spec):
+    frames = set()
+    for part in spec.split(','):
+        if not part.strip():
+            continue
+        ends = [int(x) for x in part.strip().split(':')]
+        if len(ends) == 1:
+            start = end = ends[0]
+        elif len(ends) == 2:
+            start, end = ends
+        else:
+            raise ValueError('Use frame numbers or inclusive ranges, e.g. 766,760:800')
+        if start < 0 or end < start:
+            raise ValueError('Invalid snapshot frame range')
+        frames.update(range(start, end + 1))
+    return frames
 
 
 def mask_iou_for_eval(mask_a, mask_b):
@@ -465,7 +532,7 @@ def format_report_value(value):
     return str(value).replace('\t', ' ').replace('\r', ' ').replace('\n', ' ')
 
 
-def write_metric_definitions(handle, boundary_px):
+def write_metric_definitions(handle, boundary_px, experiment='none'):
     definitions = [
         '评估协议：不筛帧、不新增位姿重置；使用用户准备的RGB序列。所有汇总排除首帧。',
         'GT初始化首帧仅写入位姿，不调用refiner。逐帧表仍保留首帧，is_init=1。',
@@ -491,7 +558,9 @@ def write_metric_definitions(handle, boundary_px):
         'BackendCoverageLast_pct和BackendOffTargetRatioLast_pct为最后一轮的同口径值；首轮/末轮不同反映精炼中crop变化。首次初始化无后端调用，后端指标N/A。',
         '空区域/无有效预测/无标签/未执行项记N/A，不填0。每个汇总指标单独列N；比较版本时仍需相同frame_id集合。',
         'Track_ms为原追踪代码段耗时；FrontendTrack_ms为原前端+追踪计时范围，含GT读取/调试打印，不含读RGB、评估渲染和保存视频。后端快照采集有开销，纯测速可加--no_backend_metrics。计时汇总只统计首帧之后实际更新的帧。',
-        '三模式解释：DAv2无门控vs DAv2+GTmask是理想门控收益；DAv2+GTmask vs GT+GTmask是在同一门控下的预测深度差距；GT模式是oracle参照，不是理论性能上限。',
+        ('三模式解释：共同支持S内raw vs bias_corrected检验只修整体距离；oracle是相同支持的GT参照。'
+         if experiment != 'none' else
+         '三模式解释：DAv2无门控vs DAv2+GTmask是理想门控收益；DAv2+GTmask vs GT+GTmask是在同一门控下的预测深度差距；GT模式是oracle参照，不是理论性能上限。'),
     ]
     handle.write('# Metric report v2 (UTF-8; per-frame table is TAB-separated)\n')
     for definition in definitions:
@@ -564,6 +633,12 @@ if __name__ == "__main__":
     #     dav2 + --use_gt_mask    = DAv2 预测深度 + GT mask（门控上界，路A决定性实验）
     #     gt   + --use_gt_mask    = GT 深度 + GT mask（oracle 参考输入）
     parser.add_argument("--depth_src", type=str, default="dav2", choices=["dav2", "gt"])
+    parser.add_argument('--depth_experiment', default='none',
+                        choices=['none', 'raw', 'bias_corrected', 'oracle'],
+                        help='第二阶段GT辅助实验：原始预测/仅去均值偏差/GT，全部使用共同支持S')
+    parser.add_argument('--snapshot_frames', default='',
+                        help='保存原始浮点深度和前后位姿的原始帧号，例如 766,760:800；不重置追踪')
+    parser.add_argument('--no_video', action='store_true', help='关闭视频保存，图片与报告照常输出')
     parser.add_argument("--use_gt_mask", action='store_true', help="用 GT 位姿渲染的 mask 把深度背景清零（门控）")
     parser.add_argument("--gt_pose_dir", type=str, default=None, help="GT 位姿目录（默认 test_scene_dir/pose）")
     parser.add_argument("--gt_depth_dir", type=str, default=None, help="GT 深度目录（默认 test_scene_dir/depth）")
@@ -588,6 +663,19 @@ if __name__ == "__main__":
     parser.add_argument('--no_backend_metrics', action='store_true',
                         help='关闭后端张量快照，仅用于减少诊断计时开销；不改变追踪结果')
     args = parser.parse_args()
+    controlled_experiment = args.depth_experiment != 'none'
+    if controlled_experiment:
+        if args.no_eval:
+            parser.error('受控深度实验需要GT评估，不能使用--no_eval')
+        args.use_gt_mask = True
+        args.depth_src = 'gt' if args.depth_experiment == 'oracle' else 'dav2'
+    try:
+        snapshot_frames = parse_snapshot_frames(args.snapshot_frames)
+    except ValueError as exc:
+        parser.error(str(exc))
+    if snapshot_frames and not controlled_experiment:
+        parser.error('--snapshot_frames 当前用于 --depth_experiment 受控实验')
+    needs_dav2 = args.depth_src == 'dav2' or controlled_experiment
     if args.eval_boundary_px < 1:
         parser.error('--eval_boundary_px 必须 >= 1')
     if not 0 <= args.highlight_threshold <= 255:
@@ -601,26 +689,51 @@ if __name__ == "__main__":
     gt_depth_dir = args.gt_depth_dir or os.path.join(args.test_scene_dir, "depth")
     annotated_pose_dir = os.path.join(args.test_scene_dir, "annotated_pose")
 
-    if args.depth_src == "dav2":
+    if controlled_experiment:
+        tag = 'shared_' + args.depth_experiment
+    elif args.depth_src == "dav2":
         tag = "dav2_gtmask" if args.use_gt_mask else "dav2_nomask"
     else:
         tag = "gtdepth_gtmask" if args.use_gt_mask else "gtdepth_nomask"
 
     beijing_tz = pytz.timezone('Asia/Shanghai')
     output_dir = args.output_dir or os.path.join(
-        "/root/lanyun-tmp/output1", f"{dt.now(beijing_tz).strftime('%m%d_%H%M')}_{tag}")
+        "/root/lanyun-tmp/output", f"{dt.now(beijing_tz).strftime('%m%d_%H%M')}_{tag}")
     img_output_dir = os.path.join(output_dir, "img")
     mask_depth_output_dir = os.path.join(output_dir, "mask+depth")
     depth_error_output_dir = os.path.join(output_dir, "depth_error")
+    input_error_output_dir = os.path.join(output_dir, 'input_depth_error')
+    snapshot_output_dir = os.path.join(output_dir, 'snapshots')
+    if controlled_experiment:
+        os.makedirs(input_error_output_dir, exist_ok=True)
+    if snapshot_frames:
+        os.makedirs(snapshot_output_dir, exist_ok=True)
     os.makedirs(img_output_dir, exist_ok=True)
     os.makedirs(mask_depth_output_dir, exist_ok=True)
-    if args.depth_src == 'dav2' and not args.no_eval:
+    if needs_dav2 and not args.no_eval:
         os.makedirs(depth_error_output_dir, exist_ok=True)
 
     error_txt_path = os.path.join(output_dir, "frame_errors.txt")
     txt_file = open(error_txt_path, "w", encoding="utf-8")
     txt_file.write(f"# config: depth_src={args.depth_src} use_gt_mask={args.use_gt_mask} "
                    f"gt_pose_dir={gt_pose_dir} gt_depth_dir={gt_depth_dir}\n")
+    txt_file.write(f'# depth_experiment={args.depth_experiment}; dav2_ckpt={args.dav2_ckpt}; '
+                   f'encoder={args.dav2_encoder}; input_size={args.dav2_input_size}; max_depth={args.dav2_max_depth}\n')
+    if controlled_experiment:
+        txt_file.write('# SECOND_STAGE: S=rendered_GTmask & valid(GTdepth) & valid(DAv2). '
+                       'All arms set pixels outside S to zero. GT oracle also runs DAv2 to define identical S.\n')
+        txt_file.write('# BiasOnSupport_mm=mean_S(DAv2-GT)*1000; bias_corrected uses DAv2-b in S; '
+                       'AppliedBias_mm is subtracted, not added. No depth clipping or per-arm support changes.\n')
+        txt_file.write('# SupportInputMAE/Bias/ShapeMAE evaluate final tracker input in S. '
+                       'RawDepth/DAv2* always evaluate UNMODIFIED DAv2 in all arms, including oracle.\n')
+        txt_file.write('# DepthMAE_all still evaluates the full GT support, including intentional zeros outside S; '
+                       'oracle SupportInputMAE and DepthMAE_valid should be zero, DepthMAE_all need not be zero.\n')
+        txt_file.write('# depth_error = raw DAv2 error; input_depth_error = actual input error on S; '
+                       'snapshot frames store depths in meters, raw-mesh output poses and centered pose_last.\n')
+        txt_file.write('# First-frame GT initialization only; all subsequent steps use each arm\'s own history. '
+                       'This is continuous tracking, NOT same-state single-step replay.\n')
+        txt_file.write('# Support/prediction/GT hashes must match by frame across arms. '
+                       'This experiment uses GT and is a diagnostic intervention, not a deployable correction.\n')
 
     set_logging_format(); set_seed(0)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -632,7 +745,7 @@ if __name__ == "__main__":
 
     # ===== 加载深度模型（按需）=====
     dav2 = None
-    if args.depth_src == "dav2":
+    if needs_dav2:
         print("🚀 加载 DAv2 微调深度模型 (Depth Anything V2 metric)...")
         sys.path.insert(0, code_dir)
         from depth_anything_v2.dpt import DepthAnythingV2
@@ -680,8 +793,10 @@ if __name__ == "__main__":
                      if not args.no_eval and not args.no_backend_metrics else None)
 
     reader = YcbineoatReader(video_dir=args.test_scene_dir, zfar=np.inf)
-    video_writer = cv2.VideoWriter(os.path.join(output_dir, f"track_{tag}.mp4"), cv2.VideoWriter_fourcc(*'mp4v'), 30, (reader.W, reader.H))
-    write_metric_definitions(txt_file, args.eval_boundary_px)
+    video_writer = None
+    if not args.no_video:
+        video_writer = cv2.VideoWriter(os.path.join(output_dir, f"track_{tag}.mp4"), cv2.VideoWriter_fourcc(*'mp4v'), 30, (reader.W, reader.H))
+    write_metric_definitions(txt_file, args.eval_boundary_px, args.depth_experiment)
     sequence_digest = hashlib.sha256('\n'.join(reader.id_strs).encode('utf-8')).hexdigest()
     txt_file.write(f'# frame_count={len(reader.id_strs)} frame_id_sha256={sequence_digest}\n')
     txt_file.write(f'# backend_capture={backend_probe is not None}; track_refine_iter={args.track_refine_iter}; '
@@ -692,6 +807,7 @@ if __name__ == "__main__":
     previous_mask = None
 
     previous_dav2_bias = None
+    run_completed = False
 
     try:
         for i in range(len(reader.color_files)):
@@ -706,6 +822,9 @@ if __name__ == "__main__":
             if frame_gt_pose is None and os.path.exists(ann_path_i):
                 frame_gt_pose = np.load(ann_path_i)
 
+            if controlled_experiment and not valid_pose_for_eval(frame_gt_pose):
+                raise ValueError(f'{reader.id_strs[i]}: 受控实验要求有效GT pose，不回退或跳帧')
+
             if i == 0:
                 assert frame_gt_pose is not None, f"首帧需要 GT 位姿，未找到: {gt_pose_path}"
                 previous_pose = frame_gt_pose
@@ -714,11 +833,29 @@ if __name__ == "__main__":
             have_obs = True  # 保留原有缺观测行为；数据筛选由用户在运行前完成。
             pose_updated = False
             raw_depth_eval = None
+            experiment_stats = {}
+            reference_for_experiment = None
+            capture_snapshot = frame_number_from_id(reader.id_strs[i]) in snapshot_frames
+            pose_before = previous_pose.copy() if capture_snapshot else None
+            internal_before = (est.pose_last.detach().cpu().numpy().copy()
+                               if capture_snapshot and i > 0 else None)
             if backend_probe is not None:
                 backend_probe.reset()
 
             with torch.no_grad():
-                if args.depth_src == "dav2":
+                if controlled_experiment:
+                    depth_path = os.path.join(gt_depth_dir, f'{reader.id_strs[i]}.npy')
+                    if not os.path.isfile(depth_path):
+                        raise FileNotFoundError(f'{reader.id_strs[i]}: 缺GT depth，受控实验不跳帧或回退')
+                    reference_for_experiment = np.load(depth_path).astype(np.float32)
+                    if reference_for_experiment.shape != (H, W):
+                        raise ValueError(f'{depth_path}: 受控实验要求GT depth与RGB同尺寸，得到{reference_for_experiment.shape}')
+                    color_bgr = cv2.cvtColor(color, cv2.COLOR_RGB2BGR)
+                    raw_depth_eval = dav2.infer_image(color_bgr, input_size=args.dav2_input_size).astype(np.float32)
+                    rd = render_gt_depth_map(frame_gt_pose, reader.K, H, W, glctx, gt_mesh_tensors)
+                    current_depth, current_mask, experiment_stats = build_bias_experiment(
+                        raw_depth_eval, reference_for_experiment, rd > 0.001, args.depth_experiment)
+                elif args.depth_src == "dav2":
                     color_bgr = cv2.cvtColor(color, cv2.COLOR_RGB2BGR)
                     current_depth = dav2.infer_image(color_bgr, input_size=args.dav2_input_size).astype(np.float32)
                 else:  # gt
@@ -733,9 +870,11 @@ if __name__ == "__main__":
                         have_obs = False
                         print(f"⚠️ 帧{i:04d} 缺 GT 深度，该帧不更新位姿")
 
-                if not args.no_eval:
+                if not args.no_eval and not controlled_experiment:
                     raw_depth_eval = current_depth.copy()
-                if args.use_gt_mask:
+                if controlled_experiment:
+                    pass  # Already gated to the identical S; do not gate or fill again.
+                elif args.use_gt_mask:
                     # GT mask：有 GT 位姿用 GT（oracle），否则用上一帧预测位姿渲染
                     mask_pose = frame_gt_pose if frame_gt_pose is not None else previous_pose
                     rd = render_gt_depth_map(mask_pose, reader.K, H, W, glctx, gt_mesh_tensors)
@@ -809,6 +948,10 @@ if __name__ == "__main__":
                        BoundaryPixels=np.nan, InteriorPixels=np.nan, Err2DPoints=0,
                        BackendIterations=0, BackendStatus='disabled' if backend_probe is None else 'not_run',
                        Track_ms=track_time_ms, FrontendTrack_ms=frame_time_ms, notes='')
+            row.update(experiment_stats)
+            row['depth_experiment'] = args.depth_experiment
+            if controlled_experiment:
+                row['input_mask_kind'] = 'shared_support_S'
             notes = []
             frame_error = None
             err_str = ' | 纯推理模式' if args.no_eval else ''
@@ -855,7 +998,8 @@ if __name__ == "__main__":
                 depth_gt_path = os.path.join(gt_depth_dir, f'{frame_id}.npy')
                 if os.path.exists(depth_gt_path):
                     try:
-                        depth_gt_val = np.load(depth_gt_path).astype(np.float32)
+                        depth_gt_val = (reference_for_experiment if controlled_experiment
+                                        else np.load(depth_gt_path).astype(np.float32))
                         if depth_gt_val.ndim != 2:
                             raise ValueError(f'GT depth must be HxW, got {depth_gt_val.shape}')
                         if depth_gt_val.shape != (H, W):
@@ -864,17 +1008,21 @@ if __name__ == "__main__":
                         row['has_gt_depth'] = int(gt_mask_val.any())
                         annotation = gt_data.get(frame_name, {})
                         ball_points_eval = [annotation.get(f'ball_{j}') for j in ball_ids]
-                        diagnostic_depth = raw_depth_eval if args.depth_src == 'dav2' else None
+                        diagnostic_depth = raw_depth_eval if needs_dav2 else None
                         row.update(calculate_depth_metrics(
                             current_depth, depth_gt_val, args.eval_boundary_px, raw_depth_eval,
                             diagnostic_depth=diagnostic_depth, color_rgb=color,
                             ball_points=ball_points_eval,
                             highlight_threshold=args.highlight_threshold,
                             ball_radius_px=args.ball_radius_px))
-                        if args.depth_src == 'dav2' and diagnostic_depth is not None and gt_mask_val.any():
+                        if needs_dav2 and diagnostic_depth is not None and gt_mask_val.any():
                             save_signed_error_panel(
                                 os.path.join(depth_error_output_dir, f'{frame_id}.png'),
                                 color, diagnostic_depth, depth_gt_val, args.error_vis_limit_mm)
+                            if controlled_experiment:
+                                save_signed_error_panel(
+                                    os.path.join(input_error_output_dir, f'{frame_id}.png'),
+                                    color, current_depth, depth_gt_val, args.error_vis_limit_mm)
                             if np.isfinite(row['DAv2ErrorMean_mm']):
                                 if previous_dav2_bias is not None:
                                     row['DepthBiasDelta_mm'] = row['DAv2ErrorMean_mm'] - previous_dav2_bias
@@ -912,17 +1060,36 @@ if __name__ == "__main__":
                 print(f'⚠️ 评估提示 [{frame_id}]: {row["notes"]}')
             metric_rows.append(row)
 
+            if capture_snapshot:
+                tf_c = est.get_tf_to_centered_mesh().detach().cpu().numpy().reshape(4, 4)
+                if internal_before is None:  # First frame has initialization, no refiner update.
+                    internal_before = est.pose_last.detach().cpu().numpy().copy()
+                np.savez_compressed(
+                    os.path.join(snapshot_output_dir, f'{frame_id}.npz'),
+                    rgb=color, K=reader.K, depth_raw=raw_depth_eval,
+                    depth_gt=reference_for_experiment, depth_input=current_depth,
+                    support=current_mask, bias_m=experiment_stats['BiasOnSupport_mm'] / 1000.0,
+                    pose_gt=frame_gt_pose, pose_before=pose_before, pose_after=pose,
+                    pose_last_before=internal_before,
+                    pose_last_after=est.pose_last.detach().cpu().numpy().copy(),
+                    tf_to_centered_mesh=tf_c, mode=args.depth_experiment, is_init=(i == 0))
+
             cv2.imwrite(os.path.join(img_output_dir, f"{reader.id_strs[i]}.png"), vis[..., ::-1])
-            video_writer.write(vis[..., ::-1])
+            if video_writer is not None:
+                video_writer.write(vis[..., ::-1])
 
             print(f"🔹 帧 {i + 1:04d} [{frame_id}] 完成 | Track: {track_time_ms:.1f}ms | Total: {frame_time_ms:.1f}ms{err_str}")
             txt_file.write('\t'.join(format_report_value(row.get(name)) for name in FRAME_COLUMNS) + '\n')
             txt_file.flush()
 
+        run_completed = True
+
     finally:
         if backend_probe is not None:
             backend_probe.close()
-        video_writer.release()
+        if video_writer is not None:
+            video_writer.release()
         if 'txt_file' in locals() and not txt_file.closed:
             write_metric_summary(txt_file, metric_rows)
+            txt_file.write(f'\n# run_completed={run_completed}\n')
             txt_file.close()
